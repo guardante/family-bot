@@ -308,7 +308,7 @@ func (b *Bot) execDeleteEvent(ctx context.Context, chatID int64, user *storage.U
 		b.reply(ctx, chatID, "Скажи, какое событие удалить — хотя бы часть названия 🙏")
 		return "[не поняла, что удалять]"
 	}
-	events, err := b.upcomingEvents(ctx, user, 50)
+	events, err := b.store.EventsAll(ctx, user.ID, 50)
 	if err != nil {
 		slog.Error("events list", "err", err)
 		b.reply(ctx, chatID, "Не получилось загрузить события 😔")
@@ -351,7 +351,7 @@ func (b *Bot) execMoveEvent(ctx context.Context, chatID int64, user *storage.Use
 		return "[не поняла, куда переносить]"
 	}
 
-	events, err := b.upcomingEvents(ctx, user, 50)
+	events, err := b.store.EventsAll(ctx, user.ID, 50)
 	if err != nil {
 		slog.Error("events list", "err", err)
 		b.reply(ctx, chatID, "Не получилось загрузить события 😔")

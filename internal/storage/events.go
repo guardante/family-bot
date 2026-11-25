@@ -41,6 +41,20 @@ func (s *Storage) AddEvent(ctx context.Context, userID int64, title, eventAtUTC 
 	return res.LastInsertId()
 }
 
+// EventsAll — все события пользователя, новыми вперёд. Нужен для поиска
+// при переносе/удалении: событие могло уже уйти в прошлое.
+func (s *Storage) EventsAll(ctx context.Context, userID int64, limit int) ([]Event, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+eventCols+` FROM events
+		WHERE user_id = ?
+		ORDER BY event_at DESC LIMIT ?`, userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanEvents(rows)
+}
+
 // UpcomingEvents — события пользователя с указанного момента (UTC строка).
 func (s *Storage) UpcomingEvents(ctx context.Context, userID int64, fromUTC string, limit int) ([]Event, error) {
 	rows, err := s.db.QueryContext(ctx, `

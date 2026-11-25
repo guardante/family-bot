@@ -572,6 +572,17 @@ func (b *Bot) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
 
 // ---- helpers ----
 
+// HandleFreeText прогоняет текст через тот же путь, что и обычное сообщение
+// (роутер -> действие). Диагностический вход для e2e-проверок.
+func (b *Bot) HandleFreeText(ctx context.Context, chatID int64, userID int64, text string) {
+	user, err := b.store.EnsureUser(ctx, userID, "", "")
+	if err != nil {
+		slog.Error("e2e: пользователь", "err", err)
+		return
+	}
+	b.handleChat(ctx, chatID, user, text)
+}
+
 func (b *Bot) answerCallback(cbID, text string) {
 	if _, err := b.api.Request(tgbotapi.NewCallback(cbID, text)); err != nil {
 		slog.Warn("answer callback", "err", err)

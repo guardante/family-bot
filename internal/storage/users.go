@@ -50,7 +50,8 @@ func New(db *sql.DB, cipher *secrets.Cipher) *Storage {
 	return &Storage{db: db, cipher: cipher}
 }
 
-const userCols = `id, username, first_name, city_name, city_lat, city_lon,
+const userCols = `id, COALESCE(username, '') AS username, COALESCE(first_name, '') AS first_name,
+	city_name, city_lat, city_lon,
 	timezone, daily_time, daily_enabled, last_daily_date, state, todoist_token,
 	caldav_login, caldav_password`
 
