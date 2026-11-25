@@ -15,6 +15,10 @@ type Config struct {
 	// Белый список Telegram ID. Пустой = пустят всех.
 	AllowedIDs []int64
 
+	// WebApp (мини-приложение): публичный HTTPS URL и порт локального сервера.
+	WebAppURL  string // напр. https://xxx.trycloudflare.com — пусто = кнопку не показывать
+	WebAppPort string
+
 	// GLM (OpenAI-совместимый API)
 	GLMAPIKey      string
 	GLMBaseURL     string
@@ -37,6 +41,8 @@ func Load() (*Config, error) {
 		GLMVisionModel: getenv("GLM_VISION_MODEL", "glm-4.5v"),
 		SQLitePath:     getenv("SQLITE_PATH", "data/nadia.db"),
 		HistoryLimit:   16,
+		WebAppURL:      strings.TrimRight(strings.TrimSpace(os.Getenv("WEBAPP_URL")), "/"),
+		WebAppPort:     getenv("WEBAPP_PORT", "8080"),
 	}
 
 	if cfg.BotToken == "" {

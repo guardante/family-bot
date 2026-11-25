@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>Надя — дела и события</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root {
+      --bg: #17212b;
+      --secondary: #232e3c;
+      --text: #f5f5f5;
+      --hint: #7d8e98;
+      --btn: #5288c1;
+      --btn-text: #ffffff;
+      --danger: #e05b5b;
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    body {
+      margin: 0;
+      background: var(--tg-theme-bg-color, var(--bg));
+      color: var(--tg-theme-text-color, var(--text));
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 16px;
+      min-height: 100vh;
+    }
+    header {
+      position: sticky; top: 0; z-index: 5;
+      background: var(--tg-theme-secondary-bg-color, var(--secondary));
+      padding: 10px 12px;
+    }
+    .tabs { display: flex; gap: 8px; }
+    .tab {
+      flex: 1; padding: 10px; border: none; border-radius: 10px;
+      background: transparent; color: var(--tg-theme-hint-color, var(--hint));
+      font-size: 15px; font-weight: 600; cursor: pointer;
+    }
+    .tab.active {
+      background: var(--tg-theme-button-color, var(--btn));
+      color: var(--tg-theme-button-text-color, var(--btn-text));
+    }
+    main { padding: 12px; padding-bottom: 40px; max-width: 640px; margin: 0 auto; }
+    .banner {
+      background: var(--tg-theme-secondary-bg-color, var(--secondary));
+      border-radius: 12px; padding: 10px 14px; margin-bottom: 12px;
+      color: var(--tg-theme-hint-color, var(--hint)); font-size: 14px;
+    }
+    form.card {
+      display: flex; gap: 8px; margin-bottom: 14px;
+      background: var(--tg-theme-secondary-bg-color, var(--secondary));
+      border-radius: 12px; padding: 10px;
+    }
+    .card.col { flex-direction: column; }
+    input, select {
+      flex: 1; min-width: 0; padding: 10px; border: none; border-radius: 8px;
+      background: var(--tg-theme-bg-color, var(--bg));
+      color: var(--tg-theme-text-color, var(--text)); font-size: 15px; outline: none;
+    }
+    .card.col input, .card.col select { width: 100%; flex: none; }
+    button.primary {
+      border: none; border-radius: 8px; padding: 10px 16px;
+      background: var(--tg-theme-button-color, var(--btn));
+      color: var(--tg-theme-button-text-color, var(--btn-text));
+      font-size: 15px; font-weight: 600; cursor: pointer;
+    }
+    button.primary:active { opacity: .8; }
+    .row {
+      display: flex; align-items: center; gap: 10px;
+      background: var(--tg-theme-secondary-bg-color, var(--secondary));
+      border-radius: 12px; padding: 12px; margin-bottom: 8px;
+    }
+    .row .check { cursor: pointer; font-size: 20px; line-height: 1; }
+    .row .label { flex: 1; word-break: break-word; }
+    .row.done .label { opacity: .5; text-decoration: line-through; }
+    .row .del {
+      border: none; background: transparent; color: var(--tg-theme-hint-color, var(--hint));
+      font-size: 16px; cursor: pointer; padding: 2px 6px;
+    }
+    .row .del:active { color: var(--danger); }
+    .when { display: block; margin-top: 3px; font-size: 13px; color: var(--tg-theme-hint-color, var(--hint)); }
+    .empty { text-align: center; color: var(--tg-theme-hint-color, var(--hint)); padding: 30px 10px; }
+    .section-title { font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: var(--tg-theme-hint-color, var(--hint)); margin: 16px 4px 8px; }
+  </style>
+</head>
+<body>
+<header>
+  <div class="tabs">
+    <button id="tab-todos" class="tab active" onclick="showTab('todos')">✅ Задачи</button>
+    <button id="tab-events" class="tab" onclick="showTab('events')">📅 События</button>
+  </div>
+</header>
+<main>
+  <div id="banner" class="banner" hidden></div>
+
+  <section id="view-todos">
+    <form id="todo-form" class="card">
+      <input id="todo-input" placeholder="Новая задача…" maxlength="200" autocomplete="off">
+      <button class="primary" type="submit">＋</button>
+    </form>
+    <div id="todo-list"></div>
+  </section>
+
+  <section id="view-events" hidden>
+    <form id="event-form" class="card col">
+      <input id="event-title" placeholder="Событие: день рождения, встреча…" maxlength="200" autocomplete="off">
+      <input id="event-datetime" type="datetime-local" required>
+      <select id="event-remind">
+        <option value="">Без напоминания</option>
+        <option value="0">Напомнить в момент начала</option>
+        <option value="15" selected>За 15 минут</option>
+        <option value="60">За 1 час</option>
+        <option value="180">За 3 часа</option>
+        <option value="1440">За день</option>
+      </select>
+      <button class="primary" type="submit">Добавить событие</button>
+    </form>
+    <div class="section-title">Ближайшие</div>
+    <div id="event-list"></div>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 	// Часовые пояса, вшитые в бинарник (в scratch-образе нет tzdata).
 	_ "time/tzdata"
 
@@ -18,6 +21,7 @@ import (
 	"nadia_bot/internal/integrations"
 	"nadia_bot/internal/integrations/todoist"
 	"nadia_bot/internal/storage"
+	"nadia_bot/internal/web"
 )
 
 const numWorkers = 4
@@ -58,6 +62,39 @@ func main() {
 	b := bot.New(cfg, api, store,
 		glm.New(cfg.GLMAPIKey, cfg.GLMBaseURL, cfg.GLMModel, cfg.GLMVisionModel),
 		registry)
+
+	// WebApp: статика мини-приложения и JSON API. Запускается только если
+	// задан WEBAPP_URL (публичный HTTPS) — иначе ничего не слушаем.
+	if cfg.WebAppURL != "" {
+		webHandler := web.New(store, registry, cfg.BotToken, cfg.IsAllowed, web.StaticFS())
+		webMux := http.NewServeMux()
+		webHandler.Register(webMux)
+		srv := &http.Server{
+			Addr:              ":" + cfg.WebAppPort,
+			Handler:           webMux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		go func() {
+			slog.Info("веб-сервер запущен", "port", cfg.WebAppPort)
+			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				slog.Error("веб-сервер", "err", err)
+			}
+		}()
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(shutdownCtx)
+		}()
+
+		// Кнопка меню чата открывает мини-приложение (нужен публичный HTTPS URL).
+		// В tgbotapi v5 нет типов Bot API 6.x, поэтому сырой запрос.
+		params := tgbotapi.Params{
+			"menu_button": `{"type":"web_app","text":"Надя","web_app":{"url":"` + cfg.WebAppURL + `"}}`,
+		}
+		if _, err := api.MakeRequest("setChatMenuButton", params); err != nil {
+			slog.Warn("не удалось задать кнопку меню", "err", err)
+		}
+	}
 
 	if err := b.SetCommands(ctx); err != nil {
 		slog.Warn("не удалось задать команды", "err", err)

@@ -51,6 +51,8 @@ func New(cfg *config.Config, api *tgbotapi.BotAPI, store *storage.Storage,
 func (b *Bot) SetCommands(ctx context.Context) error {
 	_, err := b.api.Request(tgbotapi.NewSetMyCommands(
 		tgbotapi.BotCommand{Command: "todos", Description: "Список дел"},
+		tgbotapi.BotCommand{Command: "event", Description: "Событие: 05.01 18:30 Название"},
+		tgbotapi.BotCommand{Command: "events", Description: "Ближайшие события"},
 		tgbotapi.BotCommand{Command: "weather", Description: "Погода сейчас"},
 		tgbotapi.BotCommand{Command: "city", Description: "Сменить город"},
 		tgbotapi.BotCommand{Command: "time", Description: "Время утренней погоды"},
@@ -146,10 +148,12 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message, user *st
 	case "help":
 		b.reply(ctx, chatID, "Вот что я умею:\n"+
 			"• /weather — погода на сегодня\n"+
-			"• /todos — список дел (и фото с текстом тоже можно!)\n"+
+			"• /todos — список дел\n"+
+			"• /event 05.01 18:30 Название — добавить событие (🔔 напомню за 30 мин)\n"+
+			"• /events — ближайшие события\n"+
+			"• /event_del 2 — удалить событие по номеру\n"+
 			"• /city — сменить город\n"+
 			"• /time — во сколько присылать утреннюю погоду\n"+
-			"• /settings — настройки и интеграции\n"+
 			"• /forget — забыть наш разговор\n"+
 			"• /cancel — выйти из текущего вопроса\n\n"+
 			"Пришли фото с текстом — распознаю. Просто пиши мне — отвечу на вопросы 🙂")
@@ -162,6 +166,12 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message, user *st
 		b.cmdWeather(ctx, chatID, user)
 	case "todos":
 		b.cmdTodos(ctx, chatID, user)
+	case "events":
+		b.cmdEvents(ctx, chatID, user)
+	case "event":
+		b.cmdAddEvent(ctx, chatID, user, msg.CommandArguments())
+	case "event_del":
+		b.cmdDeleteEvent(ctx, chatID, user, msg.CommandArguments())
 	case "settings":
 		b.cmdSettings(ctx, chatID, user)
 	case "forget":
@@ -218,6 +228,116 @@ func (b *Bot) cmdWeather(ctx context.Context, chatID int64, user *storage.User) 
 
 func (b *Bot) cmdTodos(ctx context.Context, chatID int64, user *storage.User) {
 	b.sendTodosList(ctx, chatID, user)
+}
+
+// cmdEvents — ближайшие события из календаря (добавляются командой /event).
+func (b *Bot) cmdEvents(ctx context.Context, chatID int64, user *storage.User) {
+	events, err := b.upcomingEvents(ctx, user, 20)
+	if err != nil {
+		slog.Error("events list", "err", err)
+		b.reply(ctx, chatID, "Не получилось загрузить события 😔")
+		return
+	}
+	if len(events) == 0 {
+		b.reply(ctx, chatID, "📅 Событий пока нет.\nДобавь: /event 05.01 18:30 День рождения мамы")
+		return
+	}
+
+	loc, err := time.LoadLocation(user.Timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+
+	var sb strings.Builder
+	sb.WriteString("📅 Ближайшие события:\n\n")
+	for i, ev := range events {
+		at, err := storage.ParseEventAt(ev.EventAt)
+		if err != nil {
+			continue
+		}
+		local := at.In(loc)
+		sb.WriteString(fmt.Sprintf("%d. %s\n    %s", i+1, ev.Title, local.Format("02.01.2006 (Mon) в 15:04")))
+		if ev.RemindMinutes != nil {
+			sb.WriteString(" · 🔔 за " + humanDelta(time.Duration(*ev.RemindMinutes)*time.Minute))
+		}
+		sb.WriteString("\n")
+	}
+	sb.WriteString("\nУдалить: /event_del номер")
+	b.reply(ctx, chatID, sb.String())
+}
+
+// upcomingEvents — события за вычетом уже прошедших (плюс запас 2 часа).
+func (b *Bot) upcomingEvents(ctx context.Context, user *storage.User, limit int) ([]storage.Event, error) {
+	return b.store.UpcomingEvents(ctx, user.ID,
+		storage.NormalizeEventAt(time.Now().Add(-2*time.Hour)), limit)
+}
+
+// cmdAddEvent — "/event 05.01 18:30 Название".
+func (b *Bot) cmdAddEvent(ctx context.Context, chatID int64, user *storage.User, args string) {
+	loc, err := time.LoadLocation(user.Timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+	title, at, err := parseEventArgs(args, loc, time.Now())
+	if err != nil {
+		b.reply(ctx, chatID, "Не поняла 🤔 "+err.Error()+".\nПример: /event 05.01 18:30 День рождения мамы")
+		return
+	}
+
+	remind := 30 // напомнить за 30 минут по умолчанию
+	if _, err := b.store.AddEvent(ctx, user.ID, title, storage.NormalizeEventAt(at), &remind); err != nil {
+		slog.Error("add event", "err", err)
+		b.reply(ctx, chatID, "Не получилось сохранить 😔")
+		return
+	}
+	b.reply(ctx, chatID, fmt.Sprintf("📅 Событие сохранено: %s\nКогда: %s\n🔔 Напомню за 30 минут",
+		title, at.Format("02.01.2006 в 15:04")))
+}
+
+// cmdDeleteEvent — "/event_del 2" по нумерации из /events.
+func (b *Bot) cmdDeleteEvent(ctx context.Context, chatID int64, user *storage.User, args string) {
+	n, err := strconv.Atoi(strings.TrimSpace(args))
+	if err != nil || n < 1 {
+		b.reply(ctx, chatID, "Укажи номер из списка /events, например: /event_del 2")
+		return
+	}
+	events, err := b.upcomingEvents(ctx, user, 20)
+	if err != nil {
+		slog.Error("events list", "err", err)
+		b.reply(ctx, chatID, "Не получилось загрузить события 😔")
+		return
+	}
+	if n > len(events) {
+		b.reply(ctx, chatID, fmt.Sprintf("В списке всего %d событий 🤷‍♀️", len(events)))
+		return
+	}
+	ev := events[n-1]
+	if err := b.store.DeleteEvent(ctx, user.ID, ev.ID); err != nil {
+		slog.Error("delete event", "err", err)
+		b.reply(ctx, chatID, "Не получилось удалить 😔")
+		return
+	}
+	b.reply(ctx, chatID, "Удалила: "+ev.Title)
+}
+
+// humanDelta — человекочитаемый интервал ("15 мин", "1 ч 30 мин", "2 дн").
+func humanDelta(d time.Duration) string {
+	m := int(d.Minutes())
+	if m < 60 {
+		return fmt.Sprintf("%d мин", m)
+	}
+	h := m / 60
+	if h < 24 {
+		if rm := m % 60; rm != 0 {
+			return fmt.Sprintf("%d ч %d мин", h, rm)
+		}
+		return fmt.Sprintf("%d ч", h)
+	}
+	days := h / 24
+	if rh := h % 24; rh != 0 {
+		return fmt.Sprintf("%d дн %d ч", days, rh)
+	}
+	return fmt.Sprintf("%d дн", days)
 }
 
 func (b *Bot) cmdSettings(ctx context.Context, chatID int64, user *storage.User) {
