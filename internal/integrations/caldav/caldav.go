@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -131,6 +132,35 @@ func (c *Client) DeleteEvent(ctx context.Context, login, password, endpoint, cal
 	}
 	objPath := strings.TrimSuffix(path, "/") + "/" + uid + ".ics"
 	return cl.RemoveAll(ctx, objPath, nil)
+}
+
+// CheckObject возвращает HTTP-статус события по UID (200 = лежит, 404 = нет).
+func (c *Client) CheckObject(ctx context.Context, login, password, endpoint, calendarName, uid string) (int, error) {
+	cl, err := c.client(ctx, login, password, endpoint)
+	if err != nil {
+		return 0, err
+	}
+	principal, err := cl.FindCurrentUserPrincipal(ctx)
+	if err != nil {
+		return 0, err
+	}
+	path, err := c.findCalendarPath(ctx, cl, principal, calendarName)
+	if err != nil {
+		return 0, err
+	}
+	objURL := strings.TrimRight(endpoint, "/") + strings.TrimSuffix(path, "/") + "/" + uid + ".ics"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, objURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.SetBasicAuth(login, password)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode, nil
 }
 
 // BuildICS собирает ICS-тело события — используется в тестах.
