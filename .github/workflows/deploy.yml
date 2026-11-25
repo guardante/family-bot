@@ -51,16 +51,18 @@ jobs:
           cache-to: type=gha,mode=max
 
   # Выполняется только если заданы секреты SSH_HOST/SSH_USER/SSH_PRIVATE_KEY/DEPLOY_DIR.
+  # Контекст env недоступен в if на уровне job, поэтому условие стоит на каждом шаге.
   deploy:
     needs: build-and-push
     runs-on: ubuntu-latest
     env:
       DEPLOY_ENABLED: ${{ secrets.SSH_HOST != '' }}
-    if: env.DEPLOY_ENABLED == 'true'
     steps:
       - uses: actions/checkout@v4
+        if: env.DEPLOY_ENABLED == 'true'
 
       - name: Настройка SSH-ключа
+        if: env.DEPLOY_ENABLED == 'true'
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
@@ -68,7 +70,7 @@ jobs:
           ssh-keyscan -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Деплой на сервер
-        working-directory: ${{ github.workspace }}
+        if: env.DEPLOY_ENABLED == 'true'
         run: |
           ssh -i ~/.ssh/deploy_key \
             "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
