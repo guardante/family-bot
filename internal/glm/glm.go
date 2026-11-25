@@ -51,11 +51,17 @@ func (c *Client) VisionModel() string { return c.visionModel }
 
 // Chat отправляет текстовый диалог и возвращает ответ модели.
 func (c *Client) Chat(ctx context.Context, messages []Message) (string, error) {
+	return c.ChatWithTemperature(ctx, messages, 0.7, 900)
+}
+
+// ChatWithTemperature — то же, но с управлением температурой и лимитом токенов
+// (пониженная температура нужна для надёжного JSON в роутере намерений).
+func (c *Client) ChatWithTemperature(ctx context.Context, messages []Message, temperature float64, maxTokens int) (string, error) {
 	return c.doChat(ctx, map[string]any{
 		"model":       c.model,
 		"messages":    messages,
-		"temperature": 0.7,
-		"max_tokens":  900,
+		"temperature": temperature,
+		"max_tokens":  maxTokens,
 	})
 }
 

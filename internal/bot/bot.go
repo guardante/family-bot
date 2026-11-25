@@ -473,47 +473,10 @@ func (b *Bot) handleTimeInput(ctx context.Context, chatID int64, user *storage.U
 	b.reply(ctx, chatID, fmt.Sprintf("Готово! Буду писать тебе в %s ⏰", hhmm))
 }
 
-// handleChat — свободный вопрос пользователя через LLM с сохранением контекста.
+// handleChat — свободное сообщение: сначала роутер намерений, он сам решит,
+// выполнить действие или поболтать.
 func (b *Bot) handleChat(ctx context.Context, chatID int64, user *storage.User, text string) {
-	if len(text) > 3500 {
-		text = text[:3500]
-	}
-
-	if err := b.store.AddMessage(ctx, user.ID, "user", text); err != nil {
-		slog.Error("save user message", "err", err)
-	}
-
-	if _, err := b.api.Request(tgbotapi.NewChatAction(chatID, "typing")); err != nil {
-		slog.Warn("chat action", "err", err)
-	}
-
-	history, err := b.store.RecentMessages(ctx, user.ID, b.cfg.HistoryLimit)
-	if err != nil {
-		slog.Error("load history", "err", err)
-		history = nil
-	}
-
-	messages := make([]glm.Message, 0, len(history)+1)
-	messages = append(messages, glm.Message{Role: "system", Content: b.systemPrompt(user)})
-	for _, m := range history {
-		messages = append(messages, glm.Message{Role: m.Role, Content: m.Content})
-	}
-
-	answer, err := b.llm.Chat(ctx, messages)
-	if err != nil {
-		slog.Error("llm chat", "err", err)
-		b.reply(ctx, chatID, "Хм, не получилось подумать 😔 Попробуй ещё раз чуть позже.")
-		return
-	}
-
-	if err := b.store.AddMessage(ctx, user.ID, "assistant", answer); err != nil {
-		slog.Error("save assistant message", "err", err)
-	}
-	if err := b.store.TrimMessages(ctx, user.ID, keepMessages); err != nil {
-		slog.Error("trim messages", "err", err)
-	}
-
-	b.reply(ctx, chatID, answer)
+	b.handleMessageFree(ctx, chatID, user, text, false)
 }
 
 func (b *Bot) systemPrompt(u *storage.User) string {
@@ -600,6 +563,16 @@ func (b *Bot) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
 func (b *Bot) answerCallback(cbID, text string) {
 	if _, err := b.api.Request(tgbotapi.NewCallback(cbID, text)); err != nil {
 		slog.Warn("answer callback", "err", err)
+	}
+}
+
+func tgbotapiChatAction(chatID int64) tgbotapi.ChatActionConfig {
+	return tgbotapi.NewChatAction(chatID, "typing")
+}
+
+func (b *Bot) trimHistory(ctx context.Context, userID int64) {
+	if err := b.store.TrimMessages(ctx, userID, keepMessages); err != nil {
+		slog.Error("trim messages", "err", err)
 	}
 }
 
