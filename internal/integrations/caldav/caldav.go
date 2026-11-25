@@ -162,20 +162,22 @@ func (c *Client) FindEventCalendar(ctx context.Context, login, password, endpoin
 	if err != nil {
 		return "", err
 	}
-	client := c.http
+
+	base := strings.TrimRight(endpoint, "/")
+	var lastErr error
 	for _, cal := range calendars {
 		if !supportsEvents(cal) {
 			continue
 		}
-		objPath := strings.TrimSuffix(cal.Path, "/") + "/" + uid + ".ics"
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, objPath, nil)
+		objURL := base + strings.TrimSuffix(cal.Path, "/") + "/" + uid + ".ics"
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, objURL, nil)
 		if err != nil {
 			return "", err
 		}
-		// basic auth через обёртку уже не применить — клиент голый.
-		// Делаем запрос через caldav-клиент GET-ом с тем же транспортом.
-		resp, err := client.Do(authRequest(req, login, password))
+		req.SetBasicAuth(login, password)
+		resp, err := c.http.Do(req)
 		if err != nil {
+			lastErr = err
 			continue
 		}
 		io.Copy(io.Discard, resp.Body)
@@ -183,13 +185,12 @@ func (c *Client) FindEventCalendar(ctx context.Context, login, password, endpoin
 		if resp.StatusCode == http.StatusOK {
 			return cal.Path, nil
 		}
+		lastErr = fmt.Errorf("календарь %q: статус %d", cal.Name, resp.StatusCode)
 	}
-	return "", errors.New("событие с этим UID не найдено ни в одном календаре")
-}
-
-func authRequest(req *http.Request, login, password string) *http.Request {
-	req.SetBasicAuth(login, password)
-	return req
+	if lastErr != nil {
+		return "", fmt.Errorf("перебор календарей: %w", lastErr)
+	}
+	return "", errors.New("подходящих календарей нет")
 }
 
 // DeleteEvent удаляет событие по UID из указанного календаря (путь).
