@@ -1,6 +1,8 @@
 services:
   bot:
     build: .
+    # Образ из GitHub Container Registry: на сервере делаем pull, локально — build.
+    image: ghcr.io/guardante/family-bot:latest
     restart: unless-stopped
     env_file: .env
     environment:

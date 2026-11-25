@@ -1,5 +1,8 @@
 # nadia_bot 🤖
 
+[![CI](https://github.com/guardante/family-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/guardante/family-bot/actions/workflows/ci.yml)
+[![Deploy](https://github.com/guardante/family-bot/actions/workflows/deploy.yml/badge.svg)](https://github.com/guardante/family-bot/actions/workflows/deploy.yml)
+
 Telegram-бот «Надя»: каждое утро присылает погоду на день, а в остальное время
 отвечает на вопросы через GLM (Z.AI). Помнит город и контекст разговора.
 
@@ -96,7 +99,43 @@ make logs      # логи бота
 make down      # остановить
 ```
 
-Обновить версию: `git pull && make rebuild` (база сохранится в volume `botdata`).
+Обновить версию: пуш в `main` — дальше всё происходит само (см. CI/CD).
+
+### CI/CD (GitHub Actions)
+
+Действия бесплатны: для публичных репозиториев — без лимита, для приватных — 2000 минут/мес.
+
+- **CI** (`ci.yml`) — на каждый пуш и PR: `gofmt`, `go vet`, сборка, тесты.
+- **Deploy** (`deploy.yml`) — на пуш в `main`:
+  1. Собирает Docker-образ в облаке (amd64 + arm64) и публикует в GHCR
+     (`ghcr.io/guardante/family-bot:latest`) — слабому серверу остаётся только скачать.
+  2. Если заданы секреты — заходит на сервер по SSH и обновляет бота
+     (`scripts/deploy.sh`: git pull → compose pull → up). Секретов нет — шаг молча пропускается.
+
+Настройка автодеплоя: *Settings → Secrets and variables → Actions → New repository secret*:
+
+| Секрет | Что указать |
+|---|---|
+| `SSH_HOST` | IP сервера |
+| `SSH_USER` | пользователь на сервере |
+| `SSH_PRIVATE_KEY` | приватный ключ (его публичная часть — в `~/.ssh/authorized_keys` на сервере) |
+| `DEPLOY_DIR` | путь к проекту на сервере, например `/home/user/family-bot` |
+
+> **После первого запуска Deploy:** пакет в GHCR по умолчанию создаётся приватным.
+> Открой вкладку *Packages → family-bot → Package settings → Change visibility → Public*,
+> иначе `docker compose pull` на сервере потребует логин.
+
+Первый запуск на сервере вручную:
+
+```bash
+git clone git@github.com:guardante/family-bot.git && cd family-bot
+cp .env.example .env && nano .env      # токен, ключ GLM, вайтлист
+docker compose pull bot
+docker compose up -d --no-build
+```
+
+Локальная разработка со сборкой на месте — по-прежнему работает:
+`docker compose up -d --build` соберёт образ из локального кода.
 
 ### Бэкап
 
