@@ -381,9 +381,10 @@ func (b *Bot) execAdd(ctx context.Context, chatID int64, user *storage.User, act
 		if err := b.caldavPush(ctx, user, id, title, at); err != nil {
 			slog.Warn("caldav push", "err", err)
 			lines = append(lines, fmt.Sprintf("⚠️ «%s» — в календарь Apple не добавилось: %v", title, err))
+		} else {
+			lines = append(lines, fmt.Sprintf("📅 %s — %s в %s (календарь «%s»)", title, at.Format("02.01"), at.Format("15:04"), b.cfg.CaldavCalendar))
+			notes = append(notes, fmt.Sprintf("%s (%s %s)", title, ev.Date, ev.Time))
 		}
-		lines = append(lines, fmt.Sprintf("📅 %s — %s в %s", title, at.Format("02.01"), at.Format("15:04")))
-		notes = append(notes, fmt.Sprintf("%s (%s %s)", title, ev.Date, ev.Time))
 	}
 
 	for _, todo := range action.Todos {
