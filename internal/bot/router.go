@@ -45,6 +45,8 @@ const systemPromptFmt = `Ты — Надя, дружелюбная ассист�
 
 Правила:
 — Изменения календаря и задач — ТОЛЬКО через вызовы инструментов. Текстовый ответ никогда ничего не выполняет, поэтому никогда не утверждай в тексте, что ты что-то создала/перенесла/удалила.
+— Смена сохранённого города через диалог недоступна в принципе: если пользователь просит сменить город («я переехал», «смени город») — ответь, что город меняется командой /city.
+— Город в запросе погоды («погода в Москве») — это разовый запрос: show_weather с city, сохранённый город не трогаем.
 — Относительные даты («завтра», «в пятницу») считай от сегодняшнего дня.
 — Погоду не выдумывай — для неё есть инструмент.
 — Если пользователь называет только название события без глагола и без даты — уточни одним вопросом.`
@@ -106,8 +108,10 @@ func routerTools() []glm.Tool {
 		}},
 		{Type: "function", Function: glm.ToolFunction{
 			Name:        "show_weather",
-			Description: "Показать погоду в городе пользователя.",
-			Parameters:  obj(map[string]any{}),
+			Description: "Показать погоду. Если пользователь назвал конкретный город — заполни city: это РАЗОВЫЙ запрос, сохранённый город не меняется. Если не назвал — покажи погоду для сохранённого города (city не заполняй).",
+			Parameters: obj(map[string]any{
+				"city": str("город для разового запроса погоды; НЕ меняет сохранённый город"),
+			}),
 		}},
 		{Type: "function", Function: glm.ToolFunction{
 			Name:        "show_events",
@@ -118,13 +122,6 @@ func routerTools() []glm.Tool {
 			Name:        "show_todos",
 			Description: "Показать список задач.",
 			Parameters:  obj(map[string]any{}),
-		}},
-		{Type: "function", Function: glm.ToolFunction{
-			Name:        "set_city",
-			Description: "Запомнить город пользователя (для погоды).",
-			Parameters: obj(map[string]any{
-				"city": str("название города"),
-			}, "city"),
 		}},
 		{Type: "function", Function: glm.ToolFunction{
 			Name:        "set_daily_time",
@@ -316,7 +313,7 @@ func (b *Bot) execAction(ctx context.Context, chatID int64, user *storage.User, 
 	case "add":
 		return b.execAdd(ctx, chatID, user, action)
 	case "show_weather":
-		b.cmdWeather(ctx, chatID, user)
+		b.execShowWeather(ctx, chatID, user, action.City)
 		return "[показала погоду]"
 	case "show_events":
 		b.cmdEvents(ctx, chatID, user)
@@ -324,8 +321,10 @@ func (b *Bot) execAction(ctx context.Context, chatID int64, user *storage.User, 
 	case "show_todos":
 		b.sendTodosList(ctx, chatID, user)
 		return "[показала дела]"
-	case "set_city":
-		return b.execSetCity(ctx, chatID, user, action.City)
+	case "delete_event":
+		return b.execDeleteEvent(ctx, chatID, user, action.Title)
+	case "move_event":
+		return b.execMoveEvent(ctx, chatID, user, action)
 	case "set_daily_time":
 		t, err := time.Parse("15:04", strings.TrimSpace(action.Time))
 		if err != nil {
@@ -339,13 +338,45 @@ func (b *Bot) execAction(ctx context.Context, chatID int64, user *storage.User, 
 		}
 		b.reply(ctx, chatID, fmt.Sprintf("Готово! Буду писать тебе в %s ⏰", hhmm))
 		return "[время утреннего сообщения: " + hhmm + "]"
-	case "delete_event":
-		return b.execDeleteEvent(ctx, chatID, user, action.Title)
-	case "move_event":
-		return b.execMoveEvent(ctx, chatID, user, action)
 	default:
 		return ""
 	}
+}
+
+// execShowWeather — погода: для названного города (разово) или сохранённого.
+func (b *Bot) execShowWeather(ctx context.Context, chatID int64, user *storage.User, city string) {
+	city = strings.TrimSpace(city)
+	if city == "" {
+		b.cmdWeather(ctx, chatID, user)
+		return
+	}
+
+	place, err := b.weather.Geocode(ctx, city)
+	if err != nil {
+		if err == weather.ErrNotFound {
+			b.reply(ctx, chatID, fmt.Sprintf("Не нашла город %q 🤔", city))
+			return
+		}
+		slog.Error("geocode", "err", err)
+		b.reply(ctx, chatID, "Сервис геокодинга не отвечает 😔 Попробуй позже.")
+		return
+	}
+
+	forecast, err := b.weather.DailyForecast(ctx, place.Latitude, place.Longitude, place.Timezone)
+	if err != nil {
+		slog.Error("forecast", "err", err)
+		b.reply(ctx, chatID, "Не смогла узнать погоду 😔 Попробуй позже.")
+		return
+	}
+	forecast.City = place.DisplayName()
+	b.reply(ctx, chatID, weather.FormatDaily(forecast)+fmt.Sprintf("\n\n📌 Разовый запрос — сохранённый город не меняла (%s).", cityOr(user)))
+}
+
+func cityOr(u *storage.User) string {
+	if u.HasCity() {
+		return *u.CityName
+	}
+	return "не задан"
 }
 
 func (b *Bot) execAdd(ctx context.Context, chatID int64, user *storage.User, action *routerAction) string {
@@ -418,30 +449,6 @@ func (b *Bot) execAdd(ctx context.Context, chatID int64, user *storage.User, act
 
 	b.reply(ctx, chatID, "Готово!\n"+strings.Join(lines, "\n"))
 	return "Добавила: " + strings.Join(notes, "; ")
-}
-
-func (b *Bot) execSetCity(ctx context.Context, chatID int64, user *storage.User, city string) string {
-	city = strings.TrimSpace(city)
-	if city == "" {
-		b.reply(ctx, chatID, "Название города не поняла 🤔 Напиши ещё раз, например: Москва")
-		return "[не поняла город]"
-	}
-	place, err := b.weather.Geocode(ctx, city)
-	if err != nil {
-		if err == weather.ErrNotFound {
-			b.reply(ctx, chatID, "Не нашла такой город 🤔 Попробуй написать иначе.")
-			return "[город не найден]"
-		}
-		slog.Error("geocode", "err", err)
-		b.reply(ctx, chatID, "Сервис геокодинга не отвечает 😔 Попробуй позже.")
-		return "[ошибка геокодинга]"
-	}
-	if err := b.store.UpdateCity(ctx, user.ID, place.Name, place.Latitude, place.Longitude, place.Timezone, ""); err != nil {
-		slog.Error("update city", "err", err)
-		return ""
-	}
-	b.reply(ctx, chatID, fmt.Sprintf("Сменила город: %s ✅", place.DisplayName()))
-	return "[город: " + place.Name + "]"
 }
 
 func (b *Bot) execDeleteEvent(ctx context.Context, chatID int64, user *storage.User, title string) string {
