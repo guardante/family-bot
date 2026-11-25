@@ -297,11 +297,11 @@ func (b *Bot) caldavPush(ctx context.Context, u *storage.User, eventID int64, ti
 	if !ok {
 		return nil // интеграция не подключена — это не ошибка
 	}
-	uid, err := b.caldav.PutEvent(ctx, login, pass, b.cfg.CaldavURL, "Надя", title, at)
+	uid, path, err := b.caldav.PutEvent(ctx, login, pass, b.cfg.CaldavURL, "Надя", title, at)
 	if err != nil {
 		return err
 	}
-	return b.store.SetEventCaldavUID(ctx, u.ID, eventID, uid)
+	return b.store.SetEventCaldav(ctx, u.ID, eventID, uid, path)
 }
 
 func caldavLogin(u *storage.User) string {
@@ -376,7 +376,19 @@ func (b *Bot) cmdDeleteEvent(ctx context.Context, chatID int64, user *storage.Us
 	// Удаляем и из календаря Apple (по возможности).
 	if deleted != nil && deleted.CaldavUID != nil {
 		if login, pass, ok := caldavCreds(user); ok {
-			if err := b.caldav.DeleteEvent(ctx, login, pass, b.cfg.CaldavURL, "Надя", *deleted.CaldavUID); err != nil {
+			path := ""
+			if deleted.CaldavPath != nil {
+				path = *deleted.CaldavPath
+			}
+			if path == "" {
+				path, err = b.caldav.FindEventCalendar(ctx, login, pass, b.cfg.CaldavURL, *deleted.CaldavUID)
+				if err != nil {
+					slog.Warn("caldav locate", "err", err)
+					b.reply(ctx, chatID, "Удалила локально; в календаре Apple не нашла: "+err.Error())
+					return
+				}
+			}
+			if err := b.caldav.DeleteEvent(ctx, login, pass, b.cfg.CaldavURL, path, *deleted.CaldavUID); err != nil {
 				slog.Warn("caldav delete", "err", err)
 			}
 		}

@@ -11,7 +11,7 @@ import (
 
 func TestListEvents(t *testing.T) {
 	login := os.Getenv("ICLOUD_LOGIN")
-	pass := os.Getenv("ICLOUD_PASS")
+	pass := testPassword(t)
 	if login == "" || pass == "" {
 		t.Skip("нет env")
 	}

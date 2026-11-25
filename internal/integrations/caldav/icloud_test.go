@@ -13,7 +13,7 @@ import (
 
 func TestIcloudPush(t *testing.T) {
 	login := os.Getenv("ICLOUD_LOGIN")
-	pass := os.Getenv("ICLOUD_PASS")
+	pass := testPassword(t)
 	if login == "" || pass == "" {
 		t.Skip("ICLOUD_LOGIN/ICLOUD_PASS не заданы")
 	}
@@ -27,13 +27,13 @@ func TestIcloudPush(t *testing.T) {
 	t.Log("валидация ок")
 
 	at := time.Now().Add(24 * time.Hour).Truncate(time.Minute)
-	uid, err := c.PutEvent(ctx, login, pass, "https://caldav.icloud.com", "Надя", "Тест Надя (проверка)", at)
+	uid, path, err := c.PutEvent(ctx, login, pass, "https://caldav.icloud.com", "Надя", "Тест Надя (проверка)", at)
 	if err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	t.Logf("событие записано, uid=%s", uid)
+	t.Logf("событие записано, uid=%s path=%s", uid, path)
 
-	if err := c.DeleteEvent(ctx, login, pass, "https://caldav.icloud.com", "Надя", uid); err != nil {
+	if err := c.DeleteEvent(ctx, login, pass, "https://caldav.icloud.com", path, uid); err != nil {
 		t.Logf("удаление: %v (событие можно убрать вручную)", err)
 	} else {
 		t.Log("удаление ок")

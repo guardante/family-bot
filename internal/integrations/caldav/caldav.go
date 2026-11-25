@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -87,29 +88,36 @@ func supportsEvents(cal caldav.Calendar) bool {
 	return false
 }
 
-// PutEvent создаёт (или перезаписывает) событие и возвращает UID.
-func (c *Client) PutEvent(ctx context.Context, login, password, endpoint, calendarName, title string, at time.Time) (string, error) {
+// PutEvent создаёт событие, возвращает UID и путь календаря, куда записали.
+func (c *Client) PutEvent(ctx context.Context, login, password, endpoint, calendarName, title string, at time.Time) (string, string, error) {
 	return c.putEvent(ctx, login, password, endpoint, calendarName, "", title, at)
 }
 
-// UpdateEvent перезаписывает событие с известным UID (перенос на другое время).
-func (c *Client) UpdateEvent(ctx context.Context, login, password, endpoint, calendarName, uid, title string, at time.Time) error {
-	_, err := c.putEvent(ctx, login, password, endpoint, calendarName, uid, title, at)
+// UpdateEvent перезаписывает событие с известным UID ровно в его календаре.
+// calendarPath — путь из caldav_path события (или имя для поиска).
+func (c *Client) UpdateEvent(ctx context.Context, login, password, endpoint, calendarPath, uid, title string, at time.Time) error {
+	_, _, err := c.putEvent(ctx, login, password, endpoint, calendarPath, uid, title, at)
 	return err
 }
 
-func (c *Client) putEvent(ctx context.Context, login, password, endpoint, calendarName, uid, title string, at time.Time) (string, error) {
+// putEvent: calendarRef — либо путь календаря (".../calendars/ID/"), либо имя.
+func (c *Client) putEvent(ctx context.Context, login, password, endpoint, calendarRef, uid, title string, at time.Time) (string, string, error) {
 	cl, err := c.client(ctx, login, password, endpoint)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	principal, err := cl.FindCurrentUserPrincipal(ctx)
-	if err != nil {
-		return "", fmt.Errorf("principal: %w", err)
-	}
-	path, err := c.findCalendarPath(ctx, cl, principal, calendarName)
-	if err != nil {
-		return "", err
+
+	path := calendarRef
+	if !strings.Contains(path, "/calendars/") {
+		// Это имя — нужно найти путь.
+		principal, err := cl.FindCurrentUserPrincipal(ctx)
+		if err != nil {
+			return "", "", fmt.Errorf("principal: %w", err)
+		}
+		path, err = c.findCalendarPath(ctx, cl, principal, calendarRef)
+		if err != nil {
+			return "", "", err
+		}
 	}
 
 	if uid == "" {
@@ -130,24 +138,76 @@ func (c *Client) putEvent(ctx context.Context, login, password, endpoint, calend
 
 	objPath := strings.TrimSuffix(path, "/") + "/" + uid + ".ics"
 	if _, err := cl.PutCalendarObject(ctx, objPath, cal, nil); err != nil {
-		return "", fmt.Errorf("запись события (календарь %s): %w", path, err)
+		return "", "", fmt.Errorf("запись события (календарь %s): %w", path, err)
 	}
-	return uid, nil
+	return uid, path, nil
 }
 
-// DeleteEvent удаляет событие по UID.
-func (c *Client) DeleteEvent(ctx context.Context, login, password, endpoint, calendarName, uid string) error {
+// FindEventCalendar ищет, в каком календаре лежит событие с данным UID.
+// Нужно для легаси-событий, записанных до хранения пути.
+func (c *Client) FindEventCalendar(ctx context.Context, login, password, endpoint, uid string) (string, error) {
+	cl, err := c.client(ctx, login, password, endpoint)
+	if err != nil {
+		return "", err
+	}
+	principal, err := cl.FindCurrentUserPrincipal(ctx)
+	if err != nil {
+		return "", err
+	}
+	home, err := cl.FindCalendarHomeSet(ctx, principal)
+	if err != nil {
+		return "", err
+	}
+	calendars, err := cl.FindCalendars(ctx, home)
+	if err != nil {
+		return "", err
+	}
+	client := c.http
+	for _, cal := range calendars {
+		if !supportsEvents(cal) {
+			continue
+		}
+		objPath := strings.TrimSuffix(cal.Path, "/") + "/" + uid + ".ics"
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, objPath, nil)
+		if err != nil {
+			return "", err
+		}
+		// basic auth через обёртку уже не применить — клиент голый.
+		// Делаем запрос через caldav-клиент GET-ом с тем же транспортом.
+		resp, err := client.Do(authRequest(req, login, password))
+		if err != nil {
+			continue
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			return cal.Path, nil
+		}
+	}
+	return "", errors.New("событие с этим UID не найдено ни в одном календаре")
+}
+
+func authRequest(req *http.Request, login, password string) *http.Request {
+	req.SetBasicAuth(login, password)
+	return req
+}
+
+// DeleteEvent удаляет событие по UID из указанного календаря (путь).
+func (c *Client) DeleteEvent(ctx context.Context, login, password, endpoint, calendarPath, uid string) error {
 	cl, err := c.client(ctx, login, password, endpoint)
 	if err != nil {
 		return err
 	}
-	principal, err := cl.FindCurrentUserPrincipal(ctx)
-	if err != nil {
-		return err
-	}
-	path, err := c.findCalendarPath(ctx, cl, principal, calendarName)
-	if err != nil {
-		return err
+	path := calendarPath
+	if !strings.Contains(path, "/calendars/") {
+		principal, err := cl.FindCurrentUserPrincipal(ctx)
+		if err != nil {
+			return err
+		}
+		path, err = c.findCalendarPath(ctx, cl, principal, path)
+		if err != nil {
+			return err
+		}
 	}
 	objPath := strings.TrimSuffix(path, "/") + "/" + uid + ".ics"
 	return cl.RemoveAll(ctx, objPath, nil)

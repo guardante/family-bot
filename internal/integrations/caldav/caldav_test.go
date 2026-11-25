@@ -31,20 +31,24 @@ func TestCaldavFullCycle(t *testing.T) {
 	}
 
 	at := time.Now().Add(24 * time.Hour).Truncate(time.Minute)
-	uid, err := c.PutEvent(ctx, user, "pass", url, "kalendar", "Тестовое событие Надя", at)
+	uid, path, err := c.PutEvent(ctx, user, "pass", url, "kalendar", "Тестовое событие Надя", at)
 	if err != nil {
 		t.Fatalf("put event: %v", err)
 	}
-	if uid == "" {
-		t.Fatal("пустой uid")
+	if uid == "" || path == "" {
+		t.Fatal("пустой uid или path")
 	}
 
 	// Перезапись с тем же UID не должна падать.
-	if _, err := c.PutEvent(ctx, user, "pass", url, "kalendar", "Тестовое событие Надя", at); err != nil {
+	if _, _, err := c.PutEvent(ctx, user, "pass", url, "kalendar", "Тестовое событие Надя", at); err != nil {
 		t.Fatalf("re-put event: %v", err)
 	}
+	// Обновление по сохранённому пути (как в проде).
+	if err := c.UpdateEvent(ctx, user, "pass", url, path, uid, "Тестовое событие Надя", at.Add(time.Hour)); err != nil {
+		t.Fatalf("update event: %v", err)
+	}
 
-	if err := c.DeleteEvent(ctx, user, "pass", url, "kalendar", uid); err != nil {
+	if err := c.DeleteEvent(ctx, user, "pass", url, path, uid); err != nil {
 		t.Fatalf("delete event: %v", err)
 	}
 }

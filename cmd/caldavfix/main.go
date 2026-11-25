@@ -47,15 +47,16 @@ func main() {
 	cipher := secrets.New(master)
 	ctx := context.Background()
 	c := caldav.New()
-	uid, err := c.PutEvent(ctx, login, pass, "https://caldav.icloud.com", "Надя", title, at)
+	uid, path, err := c.PutEvent(ctx, login, pass, "https://caldav.icloud.com", "Надя", title, at)
 	if err != nil {
 		log.Fatal("push:", err)
 	}
+	_ = path
 	userID, err := strconv.ParseInt(os.Getenv("USER_ID"), 10, 64)
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := storage.New(db, cipher).SetEventCaldavUID(ctx, userID, eventID, uid); err != nil {
+	if err := storage.New(db, cipher).SetEventCaldav(ctx, userID, eventID, uid, path); err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println("событие перенесено в календарь Apple, uid:", uid)
