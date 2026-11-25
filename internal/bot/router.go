@@ -21,21 +21,36 @@ var weekdaysRU = [...]string{"воскресенье", "понедельник",
 const routerPromptFmt = `Ты — Надя, ассистентка в Telegram-боте. Твоя задача — понять намерение пользователя и выбрать действие. Верни СТРОГО один JSON-объект, без markdown и пояснений.
 
 Действия:
-{"action":"add","events":[{"title":"...","date":"YYYY-MM-DD","time":"HH:MM"}],"todos":["текст задачи"]} — записать. events — события с датой и временем (встречи, напоминания вида «напомни завтра в 7»); todos — задачи без даты и времени (списки, «не забыть купить»). Если у события не названо время — ставь 09:00. Заполняй только подходящие поля; оба массива могут быть в одном ответе.
+{"action":"add","events":[{"title":"...","date":"YYYY-MM-DD","time":"HH:MM"}],"todos":["текст задачи"]} — записать. events — события с датой и временем (встречи, напоминания вида «напомни завтра в 7»); todos — задачи без даты и времени (списки, «не забыть купить»). Если у события не названо время — ставь 09:00. Оба массива могут быть в одном ответе.
+{"action":"move_event","title":"часть названия","date":"YYYY-MM-DD","time":"HH:MM"} — перенести событие на другую дату/время. Если время не названо — сохрани прежнее время события.
+{"action":"delete_event","title":"часть названия"} — удалить событие.
 {"action":"show_weather"} — спрашивают про погоду
 {"action":"show_events"} — показать записанные события
 {"action":"show_todos"} — показать список дел
 {"action":"set_city","city":"..."} — пользователь сменил или назвал свой город
-{"action":"set_daily_time","time":"ЧЧ:ММ"} — изменить время утреннего сообщения («поставь время на 21:00», «напоминай про погоду в 9 утра» — это сюда)
-{"action":"delete_event","title":"часть названия"} — удалить событие
-{"action":"move_event","title":"часть названия","date":"YYYY-MM-DD","time":"HH:MM"} — перенести событие на другую дату/время. Если время не названо — сохрани прежнее время события (время вернёшь то же, что было).
-{"action":"chat","reply":"..."} — всё остальное: вопросы, болтовня; reply — твой короткий живой ответ на языке пользователя. Погоду внутри chat не выдумывай — предлагай показать.
+{"action":"set_daily_time","time":"ЧЧ:ММ"} — изменить время утреннего сообщения («поставь время на 21:00» — это сюда)
+{"action":"chat","reply":"..."} — всё остальное: вопросы, болтовня; reply — твой короткий живой ответ на языке пользователя.
 
-Правило честности: доступен ТОЛЬКО этот список действий. Не изображай выполнение: если просьба не покрывается действиями (изменить название, отредактировать задачу и т.п.) — верни {"action":"chat"} и честно скажи, что этого пока не умеешь.
+⚠️ ВАЖНО ПРО chat: reply — это просто ТЕКСТ. Через chat НИЧЕГО не создаётся и не меняется. НИКОГДА не пиши в reply «добавила», «перенесла», «удалила», «создала» — это будет ложью, ведь chat ничего не выполняет. Для любых изменений используй только действия выше.
+
+Примеры:
+— «создай событие отдохнуть в 21:00» → add (events)
+— «купить хлеб» → add (todos)
+— «напомни завтра в 7 полить цветы» → add (events)
+— «перенеси тест на послезавтра» → move_event
+— «удали встречу» → delete_event
+— «какая погода» / «что у меня на неделе» / «покажи дела» → show_*
+— «поставь время на 21:00» → set_daily_time
+— голое название без глагола («Тест Надя») — непонятно что делать → chat с уточнением («Создать событие? Уточни дату и время»)
+— «как дела?» / «спасибо» → chat
 
 Контекст:
 — Сегодня: %s (%s), время %s, часовой пояс пользователя: %s
 — Город пользователя: %s
+— События пользователя сейчас:
+%s
+— Открытые задачи пользователя:
+%s
 — Относительные даты («завтра», «в пятницу», «через неделю») считай от сегодняшнего дня.`
 
 type routerAction struct {
@@ -67,7 +82,9 @@ func (b *Bot) routeMessage(ctx context.Context, user *storage.User, text string,
 
 	system := fmt.Sprintf(routerPromptFmt,
 		now.Format("02.01.2006"), weekdaysRU[int(now.Weekday())],
-		now.Format("15:04"), user.Timezone, city)
+		now.Format("15:04"), user.Timezone, city,
+		b.contextEvents(ctx, user, loc),
+		b.contextTodos(ctx, user))
 
 	messages := make([]glm.Message, 0, len(history)+2)
 	messages = append(messages, glm.Message{Role: "system", Content: system})
@@ -86,6 +103,44 @@ func (b *Bot) routeMessage(ctx context.Context, user *storage.User, text string,
 		return nil, fmt.Errorf("ответ роутера не разобрать: %w", err)
 	}
 	return action, nil
+}
+
+// contextEvents — фактический список событий для промпта, чтобы модель
+// не выдумывала «что у пользователя в календаре».
+func (b *Bot) contextEvents(ctx context.Context, user *storage.User, loc *time.Location) string {
+	events, err := b.upcomingEvents(ctx, user, 10)
+	if err != nil || len(events) == 0 {
+		return "— (нет)"
+	}
+	var lines []string
+	for _, ev := range events {
+		at, err := storage.ParseEventAt(ev.EventAt)
+		if err != nil {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("— %s в %s: «%s»", at.In(loc).Format("02.01.2006"), at.In(loc).Format("15:04"), ev.Title))
+	}
+	if len(lines) == 0 {
+		return "— (нет)"
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (b *Bot) contextTodos(ctx context.Context, user *storage.User) string {
+	todos, err := b.store.Todos(ctx, user.ID, 10)
+	if err != nil {
+		return "— (нет)"
+	}
+	var lines []string
+	for _, t := range todos {
+		if !t.Done {
+			lines = append(lines, "— "+t.Text)
+		}
+	}
+	if len(lines) == 0 {
+		return "— (нет)"
+	}
+	return strings.Join(lines, "\n")
 }
 
 func parseRouterAction(answer string) (*routerAction, error) {
