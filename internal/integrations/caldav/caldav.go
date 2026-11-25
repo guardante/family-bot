@@ -5,9 +5,7 @@ package caldav
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -45,10 +43,9 @@ func (c *Client) Validate(ctx context.Context, login, password, endpoint string)
 	return nil
 }
 
-// findCalendarPath возвращает путь календаря для событий:
-// приоритет — календарь с именем name («Надя»), иначе первый записываемый,
-// который принимает VEVENT. Списки Reminders у iCloud отдают только VTODO —
-// запись VEVENT в них даёт 403, поэтому фильтруем по SupportedComponentSet.
+// findCalendarPath находит календарь СТРОГО по имени. Никаких fallback-ов:
+// предсказуемость важнее «удобства». Календарь должен существовать,
+// принимать события (VEVENT) и быть записываемым.
 func (c *Client) findCalendarPath(ctx context.Context, cl *caldav.Client, principal, name string) (string, error) {
 	home, err := cl.FindCalendarHomeSet(ctx, principal)
 	if err != nil {
@@ -58,34 +55,15 @@ func (c *Client) findCalendarPath(ctx context.Context, cl *caldav.Client, princi
 	if err != nil {
 		return "", fmt.Errorf("список календарей: %w", err)
 	}
-	fallback := ""
 	for _, cal := range calendars {
-		if !supportsEvents(cal) {
-			continue
-		}
-		if strings.EqualFold(cal.Name, name) {
+		if strings.EqualFold(strings.TrimSpace(cal.Name), name) {
+			if cal.ReadOnly {
+				return "", fmt.Errorf("календарь %q только для чтения", name)
+			}
 			return cal.Path, nil
 		}
-		if fallback == "" {
-			fallback = cal.Path
-		}
 	}
-	if fallback != "" {
-		return fallback, nil
-	}
-	return "", errors.New("нет подходящего календаря для событий (только списки напоминаний?)")
-}
-
-func supportsEvents(cal caldav.Calendar) bool {
-	if cal.ReadOnly {
-		return false
-	}
-	for _, comp := range cal.SupportedComponentSet {
-		if strings.EqualFold(comp, "VEVENT") {
-			return true
-		}
-	}
-	return false
+	return "", fmt.Errorf("не найден календарь %q — создай его в приложении Календарь (или задай CALDAV_CALENDAR)", name)
 }
 
 // PutEvent создаёт событие, возвращает UID и путь календаря, куда записали.
@@ -93,31 +71,25 @@ func (c *Client) PutEvent(ctx context.Context, login, password, endpoint, calend
 	return c.putEvent(ctx, login, password, endpoint, calendarName, "", title, at)
 }
 
-// UpdateEvent перезаписывает событие с известным UID ровно в его календаре.
-// calendarPath — путь из caldav_path события (или имя для поиска).
-func (c *Client) UpdateEvent(ctx context.Context, login, password, endpoint, calendarPath, uid, title string, at time.Time) error {
-	_, _, err := c.putEvent(ctx, login, password, endpoint, calendarPath, uid, title, at)
+// UpdateEvent перезаписывает событие с известным UID в том же календаре.
+func (c *Client) UpdateEvent(ctx context.Context, login, password, endpoint, calendarName, uid, title string, at time.Time) error {
+	_, _, err := c.putEvent(ctx, login, password, endpoint, calendarName, uid, title, at)
 	return err
 }
 
-// putEvent: calendarRef — либо путь календаря (".../calendars/ID/"), либо имя.
-func (c *Client) putEvent(ctx context.Context, login, password, endpoint, calendarRef, uid, title string, at time.Time) (string, string, error) {
+// putEvent: calendarName — имя календаря из настроек (один и тот же всегда).
+func (c *Client) putEvent(ctx context.Context, login, password, endpoint, calendarName, uid, title string, at time.Time) (string, string, error) {
 	cl, err := c.client(ctx, login, password, endpoint)
 	if err != nil {
 		return "", "", err
 	}
-
-	path := calendarRef
-	if !strings.Contains(path, "/calendars/") {
-		// Это имя — нужно найти путь.
-		principal, err := cl.FindCurrentUserPrincipal(ctx)
-		if err != nil {
-			return "", "", fmt.Errorf("principal: %w", err)
-		}
-		path, err = c.findCalendarPath(ctx, cl, principal, calendarRef)
-		if err != nil {
-			return "", "", err
-		}
+	principal, err := cl.FindCurrentUserPrincipal(ctx)
+	if err != nil {
+		return "", "", fmt.Errorf("principal: %w", err)
+	}
+	path, err := c.findCalendarPath(ctx, cl, principal, calendarName)
+	if err != nil {
+		return "", "", err
 	}
 
 	if uid == "" {
@@ -143,72 +115,19 @@ func (c *Client) putEvent(ctx context.Context, login, password, endpoint, calend
 	return uid, path, nil
 }
 
-// FindEventCalendar ищет, в каком календаре лежит событие с данным UID.
-// Нужно для легаси-событий, записанных до хранения пути.
-func (c *Client) FindEventCalendar(ctx context.Context, login, password, endpoint, uid string) (string, error) {
-	cl, err := c.client(ctx, login, password, endpoint)
-	if err != nil {
-		return "", err
-	}
-	principal, err := cl.FindCurrentUserPrincipal(ctx)
-	if err != nil {
-		return "", err
-	}
-	home, err := cl.FindCalendarHomeSet(ctx, principal)
-	if err != nil {
-		return "", err
-	}
-	calendars, err := cl.FindCalendars(ctx, home)
-	if err != nil {
-		return "", err
-	}
-
-	base := strings.TrimRight(endpoint, "/")
-	var lastErr error
-	for _, cal := range calendars {
-		if !supportsEvents(cal) {
-			continue
-		}
-		objURL := base + strings.TrimSuffix(cal.Path, "/") + "/" + uid + ".ics"
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, objURL, nil)
-		if err != nil {
-			return "", err
-		}
-		req.SetBasicAuth(login, password)
-		resp, err := c.http.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		if resp.StatusCode == http.StatusOK {
-			return cal.Path, nil
-		}
-		lastErr = fmt.Errorf("календарь %q: статус %d", cal.Name, resp.StatusCode)
-	}
-	if lastErr != nil {
-		return "", fmt.Errorf("перебор календарей: %w", lastErr)
-	}
-	return "", errors.New("подходящих календарей нет")
-}
-
-// DeleteEvent удаляет событие по UID из указанного календаря (путь).
-func (c *Client) DeleteEvent(ctx context.Context, login, password, endpoint, calendarPath, uid string) error {
+// DeleteEvent удаляет событие по UID из настроенного календаря.
+func (c *Client) DeleteEvent(ctx context.Context, login, password, endpoint, calendarName, uid string) error {
 	cl, err := c.client(ctx, login, password, endpoint)
 	if err != nil {
 		return err
 	}
-	path := calendarPath
-	if !strings.Contains(path, "/calendars/") {
-		principal, err := cl.FindCurrentUserPrincipal(ctx)
-		if err != nil {
-			return err
-		}
-		path, err = c.findCalendarPath(ctx, cl, principal, path)
-		if err != nil {
-			return err
-		}
+	principal, err := cl.FindCurrentUserPrincipal(ctx)
+	if err != nil {
+		return err
+	}
+	path, err := c.findCalendarPath(ctx, cl, principal, calendarName)
+	if err != nil {
+		return err
 	}
 	objPath := strings.TrimSuffix(path, "/") + "/" + uid + ".ics"
 	return cl.RemoveAll(ctx, objPath, nil)

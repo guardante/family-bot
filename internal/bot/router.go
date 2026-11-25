@@ -402,25 +402,11 @@ func (b *Bot) execMoveEvent(ctx context.Context, chatID int64, user *storage.Use
 		}
 		if ev.CaldavUID != nil {
 			if login, pass, ok := caldavCreds(user); ok {
-				// Ищем календарь события: из базы, а для легаси — перебором.
-				path := ""
-				if ev.CaldavPath != nil {
-					path = *ev.CaldavPath
-				}
-				if path == "" {
-					path, err = b.caldav.FindEventCalendar(ctx, login, pass, b.cfg.CaldavURL, *ev.CaldavUID)
-					if err != nil {
-						slog.Warn("caldav locate", "err", err)
-						b.reply(ctx, chatID, "Перенесла локально, но не нашла событие в календаре Apple: "+err.Error())
-						return "[перенесла локально, caldav не найден]"
-					}
-				}
-				if err := b.caldav.UpdateEvent(ctx, login, pass, b.cfg.CaldavURL, path, *ev.CaldavUID, ev.Title, newAt); err != nil {
+				if err := b.caldav.UpdateEvent(ctx, login, pass, b.cfg.CaldavURL, b.cfg.CaldavCalendar, *ev.CaldavUID, ev.Title, newAt); err != nil {
 					slog.Warn("caldav move", "err", err)
 					b.reply(ctx, chatID, fmt.Sprintf("Перенесла локально, но в календаре Apple не обновилось: %v", err))
 					return "[перенесла локально, caldav ошибка]"
 				}
-				_ = b.store.SetEventCaldav(ctx, user.ID, ev.ID, *ev.CaldavUID, path)
 			}
 		}
 		b.reply(ctx, chatID, fmt.Sprintf("Перенесла «%s»: %s → %s",

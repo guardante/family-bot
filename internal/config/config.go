@@ -25,8 +25,10 @@ type Config struct {
 	STTAPIKey  string
 	STTModel   string
 
-	// CalDAV-сервер (по умолчанию iCloud — календарь Apple на iPhone/Mac).
-	CaldavURL string
+	// CalDAV-сервер (по умолчанию iCloud — календарь Apple на iPhone/Mac)
+	// и имя календаря, в который бот пишет события. Жёстко и предсказуемо.
+	CaldavURL      string
+	CaldavCalendar string
 
 	// GLM (OpenAI-совместимый API)
 	GLMAPIKey      string
@@ -60,6 +62,7 @@ func Load() (*Config, error) {
 		STTAPIKey:      strings.TrimSpace(os.Getenv("STT_API_KEY")),
 		STTModel:       getenv("STT_MODEL", "whisper-large-v3-turbo"),
 		CaldavURL:      getenv("CALDAV_URL", "https://caldav.icloud.com"),
+		CaldavCalendar: getenv("CALDAV_CALENDAR", "Домашний"),
 	}
 
 	if cfg.BotToken == "" {

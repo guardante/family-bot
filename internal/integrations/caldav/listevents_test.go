@@ -27,9 +27,6 @@ func TestListEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, cal := range cals {
-		if !supportsEvents(cal) {
-			continue
-		}
 		objs, err := cl.QueryCalendar(context.Background(), cal.Path,
 			&caldav.CalendarQuery{CompFilter: caldav.CompFilter{
 				Name:  "VCALENDAR",
