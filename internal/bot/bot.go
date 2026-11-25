@@ -187,7 +187,14 @@ func (b *Bot) handleCityInput(ctx context.Context, chatID int64, user *storage.U
 		return
 	}
 
-	if err := b.store.UpdateCity(ctx, user.ID, place.Name, place.Latitude, place.Longitude, place.Timezone); err != nil {
+	// Прогноз уйдёт пользователю прямо сейчас (ниже), поэтому сегодняшний
+	// утренний тик пропускаем — иначе он придёт вторым в течение 30 секунд.
+	today := ""
+	if loc, err := time.LoadLocation(place.Timezone); err == nil {
+		today = time.Now().In(loc).Format("2006-01-02")
+	}
+
+	if err := b.store.UpdateCity(ctx, user.ID, place.Name, place.Latitude, place.Longitude, place.Timezone, today); err != nil {
 		slog.Error("update city", "err", err)
 		return
 	}

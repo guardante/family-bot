@@ -42,7 +42,7 @@ func TestSQLiteFullCycle(t *testing.T) {
 	}
 
 	// --- город ---
-	if err := s.UpdateCity(ctx, 42, "Казань", 55.79, 49.13, "Europe/Moscow"); err != nil {
+	if err := s.UpdateCity(ctx, 42, "Казань", 55.79, 49.13, "Europe/Moscow", "2026-11-25"); err != nil {
 		t.Fatalf("update city: %v", err)
 	}
 	u, err = s.GetUser(ctx, 42)
@@ -54,6 +54,9 @@ func TestSQLiteFullCycle(t *testing.T) {
 	}
 	if u.CityLat == nil || *u.CityLat < 55.78 || *u.CityLat > 55.80 {
 		t.Fatalf("lat not saved: %+v", u)
+	}
+	if u.LastDailyDate == nil || *u.LastDailyDate != "2026-11-25" {
+		t.Fatalf("сегодняшняя рассылка должна быть помечена при онбординге: %+v", u)
 	}
 
 	// --- время рассылки (сбрасывает state) ---

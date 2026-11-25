@@ -72,13 +72,18 @@ func (s *Storage) GetUser(ctx context.Context, id int64) (*User, error) {
 	return u, nil
 }
 
-func (s *Storage) UpdateCity(ctx context.Context, id int64, name string, lat, lon float64, timezone string) error {
+// UpdateCity сохраняет город и помечает сегодняшнюю рассылку отправленной:
+// пользователь уже получил прогноз в момент онбординга, и шедулер не должен
+// на ближайшем тике «навёрстывать» этот день вторым сообщением.
+func (s *Storage) UpdateCity(ctx context.Context, id int64, name string, lat, lon float64, timezone, dailySentDate string) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE users
 		SET city_name = ?, city_lat = ?, city_lon = ?,
-			timezone = ?, state = '', updated_at = datetime('now')
+			timezone = ?, state = '',
+			last_daily_date = NULLIF(?, ''),
+			updated_at = datetime('now')
 		WHERE id = ?`,
-		name, lat, lon, timezone, id)
+		name, lat, lon, timezone, dailySentDate, id)
 	return err
 }
 
