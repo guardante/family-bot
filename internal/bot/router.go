@@ -21,13 +21,14 @@ var weekdaysRU = [...]string{"воскресенье", "понедельник",
 
 // routerAction — нормализованное действие из вызова инструмента.
 type routerAction struct {
-	Action string `json:"action"`
-	Reply  string `json:"reply"`
-	City   string `json:"city"`
-	Time   string `json:"time"`
-	Date   string `json:"date"`
-	Title  string `json:"title"`
-	Events []struct {
+	Action  string `json:"action"`
+	Reply   string `json:"reply"`
+	City    string `json:"city"`
+	Time    string `json:"time"`
+	Date    string `json:"date"`
+	Title   string `json:"title"`
+	RawText string `json:"-"` // исходное сообщение (для извлечения города в коде)
+	Events  []struct {
 		Title string `json:"title"`
 		Date  string `json:"date"`
 		Time  string `json:"time"`
@@ -46,10 +47,10 @@ const systemPromptFmt = `Ты — Надя, дружелюбная ассист�
 Правила:
 — Выполняй ТОЛЬКО ПОСЛЕДНЕЕ сообщение пользователя. История — это контекст: всё, что было раньше, уже обработано (заметки ассистентки в [скобках] — выполненные действия). Не повторяй, не доделывай и не «исправляй» старые просьбы.
 — Изменения календаря и задач — ТОЛЬКО через вызовы инструментов. Текстовый ответ никогда ничего не выполняет, поэтому никогда не утверждай в тексте, что ты что-то создала/перенесла/удалила.
-— Смена сохранённого города через диалог недоступна в принципе: если пользователь просит сменить город («я переехал», «смени город») — ответь, что город меняется командой /city.
-— Город в запросе погоды («погода в Москве», «можно мне погоду в Тюмени?») — это разовый запрос: show_weather с city=<названный город>, сохранённый город не трогаем. Названный город ВСЕГДА попадает в city, даже если запрос вежливый или косвенный.
+— Запрос погоды = инструмент show_weather. Параметр city — это ПРОСТО КОПИЯ города из текста сообщения (как.search-запрос): «погоду в Тюмени» → city=Тюмень; «можно погоду в Сочи?» → city=Сочи; города нет → city="". city НИКАК не связан с сохранённым городом и настройками — просто копируй то, что написано.
+— Если пользователь просит ИЗМЕНИТЬ сохранённый город («я переехал», «смени город») — ответь, что город меняется командой /city (инструментом это не делается).
 — Относительные даты («завтра», «в пятницу») считай от сегодняшнего дня.
-— Погоду не выдумывай — для неё есть инструмент.
+— Если пользователь называет только название события без глагола и без даты — уточни одним вопросом.
 — Если пользователь называет только название события без глагола и без даты — уточни одним вопросом.`
 
 // routerTools — «скилы» Надежды для function calling.
@@ -172,6 +173,7 @@ func (b *Bot) routeMessage(ctx context.Context, user *storage.User, text string,
 			slog.Warn("tool call", "name", call.Function.Name, "err", err)
 			continue
 		}
+		a.RawText = text
 		actions = append(actions, a)
 	}
 	return actions, strings.TrimSpace(content), nil
@@ -314,7 +316,7 @@ func (b *Bot) execAction(ctx context.Context, chatID int64, user *storage.User, 
 	case "add":
 		return b.execAdd(ctx, chatID, user, action)
 	case "show_weather":
-		b.execShowWeather(ctx, chatID, user, action.City)
+		b.execShowWeather(ctx, chatID, user, action.City, action.RawText)
 		return "[показала погоду]"
 	case "show_events":
 		b.cmdEvents(ctx, chatID, user)
@@ -345,8 +347,15 @@ func (b *Bot) execAction(ctx context.Context, chatID int64, user *storage.User, 
 }
 
 // execShowWeather — погода: для названного города (разово) или сохранённого.
-func (b *Bot) execShowWeather(ctx context.Context, chatID int64, user *storage.User, city string) {
+// city приходит от модели; если пусто — пробуем извлечь город из текста
+// отдельным мини-запросом (надёжнее, чем большой роутер), иначе — дефолт.
+func (b *Bot) execShowWeather(ctx context.Context, chatID int64, user *storage.User, city, rawText string) {
 	city = strings.TrimSpace(city)
+	if city == "" && strings.TrimSpace(rawText) != "" {
+		if extracted := b.extractCity(ctx, rawText); extracted != "" {
+			city = extracted
+		}
+	}
 	if city == "" {
 		b.cmdWeather(ctx, chatID, user)
 		return
@@ -371,6 +380,24 @@ func (b *Bot) execShowWeather(ctx context.Context, chatID int64, user *storage.U
 	}
 	forecast.City = place.DisplayName()
 	b.reply(ctx, chatID, weather.FormatDaily(forecast)+fmt.Sprintf("\n\n📌 Разовый запрос — сохранённый город не меняла (%s).", cityOr(user)))
+}
+
+// extractCity — крошечный выделенный запрос: только «найди город в тексте».
+// Такие узкие задачи модель выполняет почти безошибочно.
+func (b *Bot) extractCity(ctx context.Context, text string) string {
+	answer, err := b.llm.ChatWithTemperature(ctx, []glm.Message{
+		{Role: "system", Content: `Из сообщения пользователя извлеки название города, для которого нужна погода. Верни ТОЛЬКО название города (обычное именование, например «Тюмень»), без кавычек и пояснений. Если города в сообщении нет — верни пустую строку.`},
+		{Role: "user", Content: text},
+	}, 0.0, 50)
+	if err != nil {
+		slog.Warn("extract city", "err", err)
+		return ""
+	}
+	answer = strings.TrimSpace(answer)
+	if answer != "" && answer != `""` && !strings.Contains(answer, "\n") && len([]rune(answer)) < 60 {
+		return answer
+	}
+	return ""
 }
 
 func cityOr(u *storage.User) string {
