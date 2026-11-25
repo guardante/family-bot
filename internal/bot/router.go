@@ -1,7 +1,8 @@
 package bot
 
-// Роутер намерений: любой текст или транскрипт голосового модель
-// превращает в одно из запрограммированных действий (или просто отвечает).
+// Роутер намерений через нативный function calling: модель получает
+// инструменты («скилы») и либо вызывает их, либо просто отвечает текстом.
+// Соврать про «выполнила» структурно нельзя — выполнение только через вызовы.
 
 import (
 	"context"
@@ -18,41 +19,7 @@ import (
 
 var weekdaysRU = [...]string{"воскресенье", "понедельник", "вторник", "среда", "четверг", "пятница", "суббота"}
 
-const routerPromptFmt = `Ты — Надя, ассистентка в Telegram-боте. Твоя задача — понять намерение пользователя и выбрать действие. Верни СТРОГО один JSON-объект, без markdown и пояснений.
-
-Действия:
-{"action":"add","events":[{"title":"...","date":"YYYY-MM-DD","time":"HH:MM"}],"todos":["текст задачи"]} — записать. events — события с датой и временем (встречи, напоминания вида «напомни завтра в 7»); todos — задачи без даты и времени (списки, «не забыть купить»). Если у события не названо время — ставь 09:00. Оба массива могут быть в одном ответе.
-{"action":"move_event","title":"часть названия","date":"YYYY-MM-DD","time":"HH:MM"} — перенести событие на другую дату/время. Если время не названо — сохрани прежнее время события.
-{"action":"delete_event","title":"часть названия"} — удалить событие.
-{"action":"show_weather"} — спрашивают про погоду
-{"action":"show_events"} — показать записанные события
-{"action":"show_todos"} — показать список дел
-{"action":"set_city","city":"..."} — пользователь сменил или назвал свой город
-{"action":"set_daily_time","time":"ЧЧ:ММ"} — изменить время утреннего сообщения («поставь время на 21:00» — это сюда)
-{"action":"chat","reply":"..."} — всё остальное: вопросы, болтовня; reply — твой короткий живой ответ на языке пользователя.
-
-⚠️ ВАЖНО ПРО chat: reply — это просто ТЕКСТ. Через chat НИЧЕГО не создаётся и не меняется. НИКОГДА не пиши в reply «добавила», «перенесла», «удалила», «создала» — это будет ложью, ведь chat ничего не выполняет. Для любых изменений используй только действия выше.
-
-Примеры:
-— «создай событие отдохнуть в 21:00» → add (events)
-— «купить хлеб» → add (todos)
-— «напомни завтра в 7 полить цветы» → add (events)
-— «перенеси тест на послезавтра» → move_event
-— «удали встречу» → delete_event
-— «какая погода» / «что у меня на неделе» / «покажи дела» → show_*
-— «поставь время на 21:00» → set_daily_time
-— голое название без глагола («Тест Надя») — непонятно что делать → chat с уточнением («Создать событие? Уточни дату и время»)
-— «как дела?» / «спасибо» → chat
-
-Контекст:
-— Сегодня: %s (%s), время %s, часовой пояс пользователя: %s
-— Город пользователя: %s
-— События пользователя сейчас:
-%s
-— Открытые задачи пользователя:
-%s
-— Относительные даты («завтра», «в пятницу», «через неделю») считай от сегодняшнего дня.`
-
+// routerAction — нормализованное действие из вызова инструмента.
 type routerAction struct {
 	Action string `json:"action"`
 	Reply  string `json:"reply"`
@@ -68,8 +35,109 @@ type routerAction struct {
 	Todos []string `json:"todos"`
 }
 
-// routeMessage спрашивает у модели намерение. history — последние сообщения диалога.
-func (b *Bot) routeMessage(ctx context.Context, user *storage.User, text string, history []storage.Message) (*routerAction, error) {
+const systemPromptFmt = `Ты — Надя, дружелюбная ассистентка в Telegram. Отвечай коротко, тепло и живо, на языке пользователя.
+
+Сегодня %s (%s), время %s, часовой пояс пользователя: %s. Город: %s.
+События пользователя:
+%s
+Открытые задачи:
+%s
+
+Правила:
+— Изменения календаря и задач — ТОЛЬКО через вызовы инструментов. Текстовый ответ никогда ничего не выполняет, поэтому никогда не утверждай в тексте, что ты что-то создала/перенесла/удалила.
+— Относительные даты («завтра», «в пятницу») считай от сегодняшнего дня.
+— Погоду не выдумывай — для неё есть инструмент.
+— Если пользователь называет только название события без глагола и без даты — уточни одним вопросом.`
+
+// routerTools — «скилы» Надежды для function calling.
+func routerTools() []glm.Tool {
+	obj := func(props map[string]any, required ...string) map[string]any {
+		return map[string]any{
+			"type":       "object",
+			"properties": props,
+			"required":   required,
+		}
+	}
+	str := func(desc string) map[string]any {
+		return map[string]any{"type": "string", "description": desc}
+	}
+	eventArr := func() map[string]any {
+		return map[string]any{
+			"type": "array",
+			"items": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"title": str("название события"),
+					"date":  str("дата YYYY-MM-DD"),
+					"time":  str("время HH:MM; если не названо — 09:00"),
+				},
+				"required": []string{"title", "date"},
+			},
+		}
+	}
+
+	return []glm.Tool{
+		{Type: "function", Function: glm.ToolFunction{
+			Name:        "add",
+			Description: "Записать события в календарь и/или задачи в список. События — с датой и временем; задачи — без даты («купить хлеб»).",
+			Parameters: obj(map[string]any{
+				"events": eventArr(),
+				"todos": map[string]any{
+					"type":  "array",
+					"items": map[string]any{"type": "string"},
+				},
+			}),
+		}},
+		{Type: "function", Function: glm.ToolFunction{
+			Name:        "move_event",
+			Description: "Перенести существующее событие на другую дату и/или время.",
+			Parameters: obj(map[string]any{
+				"title": str("часть названия события"),
+				"date":  str("новая дата YYYY-MM-DD"),
+				"time":  str("новое время HH:MM; опционально — иначе сохраняется прежнее"),
+			}),
+		}},
+		{Type: "function", Function: glm.ToolFunction{
+			Name:        "delete_event",
+			Description: "Удалить событие.",
+			Parameters: obj(map[string]any{
+				"title": str("часть названия события"),
+			}, "title"),
+		}},
+		{Type: "function", Function: glm.ToolFunction{
+			Name:        "show_weather",
+			Description: "Показать погоду в городе пользователя.",
+			Parameters:  obj(map[string]any{}),
+		}},
+		{Type: "function", Function: glm.ToolFunction{
+			Name:        "show_events",
+			Description: "Показать записанные события.",
+			Parameters:  obj(map[string]any{}),
+		}},
+		{Type: "function", Function: glm.ToolFunction{
+			Name:        "show_todos",
+			Description: "Показать список задач.",
+			Parameters:  obj(map[string]any{}),
+		}},
+		{Type: "function", Function: glm.ToolFunction{
+			Name:        "set_city",
+			Description: "Запомнить город пользователя (для погоды).",
+			Parameters: obj(map[string]any{
+				"city": str("название города"),
+			}, "city"),
+		}},
+		{Type: "function", Function: glm.ToolFunction{
+			Name:        "set_daily_time",
+			Description: "Изменить время ежедневного сообщения с погодой.",
+			Parameters: obj(map[string]any{
+				"time": str("время HH:MM"),
+			}, "time"),
+		}},
+	}
+}
+
+// routeMessage спрашивает модель и возвращает действия + текстовый ответ.
+func (b *Bot) routeMessage(ctx context.Context, user *storage.User, text string, history []storage.Message) ([]*routerAction, string, error) {
 	loc, err := time.LoadLocation(user.Timezone)
 	if err != nil {
 		loc = time.UTC
@@ -80,7 +148,7 @@ func (b *Bot) routeMessage(ctx context.Context, user *storage.User, text string,
 		city = *user.CityName
 	}
 
-	system := fmt.Sprintf(routerPromptFmt,
+	system := fmt.Sprintf(systemPromptFmt,
 		now.Format("02.01.2006"), weekdaysRU[int(now.Weekday())],
 		now.Format("15:04"), user.Timezone, city,
 		b.contextEvents(ctx, user, loc),
@@ -93,75 +161,90 @@ func (b *Bot) routeMessage(ctx context.Context, user *storage.User, text string,
 	}
 	messages = append(messages, glm.Message{Role: "user", Content: text})
 
-	answer, err := b.llm.ChatWithTemperature(ctx, messages, 0.2, 700)
+	content, calls, err := b.llm.ToolsChat(ctx, messages, routerTools())
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
+	slog.Info("router: ответ модели", "calls", len(calls), "content", truncateString(content, 150))
 
-	action, err := parseRouterAction(answer)
-	if err != nil {
-		return nil, fmt.Errorf("ответ роутера не разобрать: %w", err)
-	}
-	return action, nil
-}
-
-// contextEvents — фактический список событий для промпта, чтобы модель
-// не выдумывала «что у пользователя в календаре».
-func (b *Bot) contextEvents(ctx context.Context, user *storage.User, loc *time.Location) string {
-	events, err := b.upcomingEvents(ctx, user, 10)
-	if err != nil || len(events) == 0 {
-		return "— (нет)"
-	}
-	var lines []string
-	for _, ev := range events {
-		at, err := storage.ParseEventAt(ev.EventAt)
+	var actions []*routerAction
+	for _, call := range calls {
+		a, err := toolToAction(call.Function.Name, call.Function.Arguments)
 		if err != nil {
+			slog.Warn("tool call", "name", call.Function.Name, "err", err)
 			continue
 		}
-		lines = append(lines, fmt.Sprintf("— %s в %s: «%s»", at.In(loc).Format("02.01.2006"), at.In(loc).Format("15:04"), ev.Title))
+		actions = append(actions, a)
 	}
-	if len(lines) == 0 {
-		return "— (нет)"
-	}
-	return strings.Join(lines, "\n")
+	return actions, strings.TrimSpace(content), nil
 }
 
-func (b *Bot) contextTodos(ctx context.Context, user *storage.User) string {
-	todos, err := b.store.Todos(ctx, user.ID, 10)
-	if err != nil {
-		return "— (нет)"
+func strArg(m map[string]any, key string) string {
+	if v, ok := m[key].(string); ok {
+		return strings.TrimSpace(v)
 	}
-	var lines []string
-	for _, t := range todos {
-		if !t.Done {
-			lines = append(lines, "— "+t.Text)
+	return ""
+}
+
+func truncateString(s string, n int) string {
+	if runed := []rune(s); len(runed) > n {
+		return string(runed[:n]) + "…"
+	}
+	return s
+}
+
+// toolToAction превращает вызов инструмента в действие для execAction.
+func toolToAction(name, argsJSON string) (*routerAction, error) {
+	var args map[string]any
+	if strings.TrimSpace(argsJSON) != "" {
+		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+			return nil, err
 		}
 	}
-	if len(lines) == 0 {
-		return "— (нет)"
-	}
-	return strings.Join(lines, "\n")
-}
 
-func parseRouterAction(answer string) (*routerAction, error) {
-	s := strings.TrimSpace(answer)
-	s = strings.TrimPrefix(s, "```json")
-	s = strings.TrimPrefix(s, "```")
-	s = strings.TrimSuffix(s, "```")
-	s = strings.TrimSpace(s)
-
-	start := strings.Index(s, "{")
-	end := strings.LastIndex(s, "}")
-	if start == -1 || end == -1 || end < start {
-		return nil, fmt.Errorf("нет JSON в ответе")
+	a := &routerAction{Action: name}
+	switch name {
+	case "add":
+		if evs, ok := args["events"].([]any); ok {
+			for _, e := range evs {
+				m, ok := e.(map[string]any)
+				if !ok {
+					continue
+				}
+				a.Events = append(a.Events, struct {
+					Title string `json:"title"`
+					Date  string `json:"date"`
+					Time  string `json:"time"`
+				}{
+					Title: strArg(m, "title"),
+					Date:  strArg(m, "date"),
+					Time:  strArg(m, "time"),
+				})
+			}
+		}
+		if todos, ok := args["todos"].([]any); ok {
+			for _, t := range todos {
+				if s, ok := t.(string); ok && strings.TrimSpace(s) != "" {
+					a.Todos = append(a.Todos, s)
+				}
+			}
+		}
+	case "move_event":
+		a.Title = strArg(args, "title")
+		a.Date = strArg(args, "date")
+		a.Time = strArg(args, "time")
+	case "delete_event":
+		a.Title = strArg(args, "title")
+	case "set_city":
+		a.City = strArg(args, "city")
+	case "set_daily_time":
+		a.Time = strArg(args, "time")
+	case "show_weather", "show_events", "show_todos":
+		// аргументов нет
+	default:
+		return nil, fmt.Errorf("неизвестный инструмент %q", name)
 	}
-
-	var action routerAction
-	if err := json.Unmarshal([]byte(s[start:end+1]), &action); err != nil {
-		return nil, err
-	}
-	action.Reply = strings.TrimSpace(action.Reply)
-	return &action, nil
+	return a, nil
 }
 
 // handleMessageFree — свободное сообщение (текст или транскрипт голосового).
@@ -187,21 +270,20 @@ func (b *Bot) handleMessageFree(ctx context.Context, chatID int64, user *storage
 		history = nil
 	}
 
-	prefix := ""
 	if transcript {
-		prefix = "🎤 Услышала: «" + text + "»\n\n"
-		b.reply(ctx, chatID, prefix)
+		b.reply(ctx, chatID, "🎤 Услышала: «"+text+"»")
 	}
 
-	action, err := b.routeMessage(ctx, user, text, history)
+	actions, reply, err := b.routeMessage(ctx, user, text, history)
 	if err != nil {
 		slog.Warn("router", "err", err)
 		b.chatFallback(ctx, chatID, user, text, history)
 		return
 	}
 
-	if action.Action == "chat" {
-		reply := action.Reply
+	if len(actions) == 0 {
+		// Модель просто отвечает.
+		reply = strings.TrimSpace(reply)
 		if reply == "" {
 			b.chatFallback(ctx, chatID, user, text, history)
 			return
@@ -214,14 +296,18 @@ func (b *Bot) handleMessageFree(ctx context.Context, chatID int64, user *storage
 		return
 	}
 
-	note := b.execAction(ctx, chatID, user, action)
-	if note == "" {
-		note = "[выполнила: " + action.Action + "]"
+	var notes []string
+	for _, a := range actions {
+		if note := b.execAction(ctx, chatID, user, a); note != "" {
+			notes = append(notes, note)
+		}
 	}
-	if err := b.store.AddMessage(ctx, user.ID, "assistant", note); err != nil {
-		slog.Error("save action note", "err", err)
+	if len(notes) > 0 {
+		if err := b.store.AddMessage(ctx, user.ID, "assistant", strings.Join(notes, "; ")); err != nil {
+			slog.Error("save action note", "err", err)
+		}
+		b.trimHistory(ctx, user.ID)
 	}
-	b.trimHistory(ctx, user.ID)
 }
 
 // execAction выполняет распознанное действие и возвращает заметку для истории.
@@ -277,7 +363,7 @@ func (b *Bot) execAdd(ctx context.Context, chatID int64, user *storage.User, act
 		if title == "" {
 			continue
 		}
-		// Дублируем подстраховку модели на случай, если она вернула пустое время.
+		// Дублируем подстраховку модели на случай пустого времени.
 		if ev.Time == "" {
 			ev.Time = defaultEventTime
 		}
@@ -382,7 +468,7 @@ func (b *Bot) execDeleteEvent(ctx context.Context, chatID int64, user *storage.U
 		}
 		if deleted != nil && deleted.CaldavUID != nil {
 			if login, pass, ok := caldavCreds(user); ok {
-				if err := b.caldav.DeleteEvent(ctx, login, pass, b.cfg.CaldavURL, "Надя", *deleted.CaldavUID); err != nil {
+				if err := b.caldav.DeleteEvent(ctx, login, pass, b.cfg.CaldavURL, b.cfg.CaldavCalendar, *deleted.CaldavUID); err != nil {
 					slog.Warn("caldav delete", "err", err)
 				}
 			}
@@ -475,7 +561,7 @@ func (b *Bot) execMoveEvent(ctx context.Context, chatID int64, user *storage.Use
 	return "[событие не найдено]"
 }
 
-// chatFallback — старый путь: обычный разговор без роутера (если роутер сломался).
+// chatFallback — обычный разговор без роутера (если роутер сломался).
 func (b *Bot) chatFallback(ctx context.Context, chatID int64, user *storage.User, text string, history []storage.Message) {
 	messages := make([]glm.Message, 0, len(history)+2)
 	messages = append(messages, glm.Message{Role: "system", Content: b.systemPrompt(user)})
@@ -495,4 +581,42 @@ func (b *Bot) chatFallback(ctx context.Context, chatID int64, user *storage.User
 	}
 	b.trimHistory(ctx, user.ID)
 	b.reply(ctx, chatID, answer)
+}
+
+// contextEvents — фактический список событий для промпта, чтобы модель
+// не выдумывала «что у пользователя в календаре».
+func (b *Bot) contextEvents(ctx context.Context, user *storage.User, loc *time.Location) string {
+	events, err := b.upcomingEvents(ctx, user, 10)
+	if err != nil || len(events) == 0 {
+		return "— (нет)"
+	}
+	var lines []string
+	for _, ev := range events {
+		at, err := storage.ParseEventAt(ev.EventAt)
+		if err != nil {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("— %s в %s: «%s»", at.In(loc).Format("02.01.2006"), at.In(loc).Format("15:04"), ev.Title))
+	}
+	if len(lines) == 0 {
+		return "— (нет)"
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (b *Bot) contextTodos(ctx context.Context, user *storage.User) string {
+	todos, err := b.store.Todos(ctx, user.ID, 10)
+	if err != nil {
+		return "— (нет)"
+	}
+	var lines []string
+	for _, t := range todos {
+		if !t.Done {
+			lines = append(lines, "— "+t.Text)
+		}
+	}
+	if len(lines) == 0 {
+		return "— (нет)"
+	}
+	return strings.Join(lines, "\n")
 }

@@ -22,6 +22,7 @@ import (
 	"nadia_bot/internal/config"
 	"nadia_bot/internal/glm"
 	"nadia_bot/internal/integrations"
+	"nadia_bot/internal/integrations/caldav"
 	"nadia_bot/internal/integrations/todoist"
 	"nadia_bot/internal/secrets"
 	"nadia_bot/internal/storage"
@@ -70,56 +71,125 @@ func main() {
 	run := func(text string) {
 		fmt.Printf("\n=== ШАГ: %s\n", text)
 		b.HandleFreeText(ctx, userID, userID, text)
-		time.Sleep(3 * time.Second)
+	}
+	// waitFor ждёт до timeout, пока условие не выполнится (GLM отвечает 2–10 с).
+	waitFor := func(timeout time.Duration, cond func() bool) bool {
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			if cond() {
+				return true
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		return cond()
 	}
 
+	// --- 0. чистим хвосты прошлых прогонов и историю ---
+	cleanupLeftovers(ctx, cfg, store, userID)
+	_ = store.ClearMessages(ctx, userID)
+	title := fmt.Sprintf("Тест Нади %s", time.Now().Format("15:04:05"))
+
 	// --- 1. создание ---
-	run("создай событие «Тест Нади» на завтра в 10:00")
-	ev1 := findTestEvent(ctx, store, userID)
-	if ev1 == nil {
+	run(fmt.Sprintf("создай событие «%s» на завтра в 10:00", title))
+	if !waitFor(25*time.Second, func() bool { return findTestEvent(ctx, store, userID) != nil }) {
 		log.Fatal("СОЗДАНИЕ ПРОВАЛЕНО: события нет в базе")
 	}
+	ev1 := findTestEvent(ctx, store, userID)
 	fmt.Printf("  в базе: id=%d %s apple_uid=%v\n", ev1.ID, ev1.EventAt, deref(ev1.CaldavUID))
 	uid1, path1 := deref(ev1.CaldavUID), deref(ev1.CaldavPath)
-	// iCloud иногда синхронизируется с задержкой
-	time.Sleep(2 * time.Second)
+	time.Sleep(2 * time.Second) // sync iCloud
 	checkApple(ctx, cfg, store, userID, uid1, path1, "после создания (ждём 200)", http.StatusOK)
 
 	// --- 2. перенос ---
-	run("перенеси событие «Тест Нади» на послезавтра в 14:00")
+	run(fmt.Sprintf("перенеси событие «%s» на послезавтра в 14:00", title))
+	if !waitFor(25*time.Second, func() bool {
+		if ev := findTestEvent(ctx, store, userID); ev != nil {
+			return ev.EventAt != ev1.EventAt
+		}
+		return false
+	}) {
+		log.Fatalf("ПЕРЕНОС ПРОВАЛЕН: время не изменилось (%s)", ev1.EventAt)
+	}
 	ev2 := findTestEvent(ctx, store, userID)
-	if ev2 == nil {
-		log.Fatal("ПЕРЕНОС ПРОВАЛЕН: событие пропало из базы")
+	if deref(ev2.CaldavUID) != uid1 {
+		log.Fatal("ПЕРЕНОС ПРОВАЛЕН: UID изменился")
 	}
-	if ev2.EventAt == ev1.EventAt {
-		log.Fatalf("ПЕРЕНОС ПРОВАЛЕН: время не изменилось (%s)", ev2.EventAt)
-	}
-	fmt.Printf("  в базе: %s -> %s (uid тот же: %v)\n", ev1.EventAt, ev2.EventAt, deref(ev2.CaldavUID) == uid1)
+	fmt.Printf("  в базе: %s -> %s (uid тот же: true)\n", ev1.EventAt, ev2.EventAt)
 	time.Sleep(2 * time.Second)
 	checkApple(ctx, cfg, store, userID, uid1, path1, "после переноса (ждём 200)", http.StatusOK)
 
 	// --- 3. удаление ---
-	run("удали событие «Тест Нади»")
-	time.Sleep(2 * time.Second)
-	if ev3 := findTestEvent(ctx, store, userID); ev3 != nil {
+	run(fmt.Sprintf("удали событие «%s»", title))
+	if !waitFor(25*time.Second, func() bool { return findTestEvent(ctx, store, userID) == nil }) {
 		log.Fatal("УДАЛЕНИЕ ПРОВАЛЕНО: событие осталось в базе")
 	}
+	time.Sleep(2 * time.Second)
 	checkApple(ctx, cfg, store, userID, uid1, path1, "после удаления (ждём 404)", http.StatusNotFound)
 
 	fmt.Println("\n=== ИТОГ: полный цикл пройден ✅")
 }
 
 func findTestEvent(ctx context.Context, store *storage.Storage, userID int64) *storage.Event {
+	all := findAllTestEvents(ctx, store, userID)
+	if len(all) == 0 {
+		return nil
+	}
+	return &all[0]
+}
+
+func findAllTestEvents(ctx context.Context, store *storage.Storage, userID int64) []storage.Event {
 	evs, err := store.EventsAll(ctx, userID, 50)
 	if err != nil {
 		return nil
 	}
+	var out []storage.Event
 	for i := range evs {
 		if strings.Contains(strings.ToLower(evs[i].Title), "тест нади") {
-			return &evs[i]
+			out = append(out, evs[i])
 		}
 	}
-	return nil
+	return out
+}
+
+// cleanupLeftovers убирает «Тест Нади» от прошлых прогонов: из Apple и из базы.
+func cleanupLeftovers(ctx context.Context, cfg *config.Config, store *storage.Storage, userID int64) {
+	user, err := store.GetUser(ctx, userID)
+	if err != nil || user == nil {
+		return
+	}
+	left := findAllTestEvents(ctx, store, userID)
+	for _, ev := range left {
+		if ev.CaldavUID == nil {
+			continue
+		}
+		if login, pass, ok := caldavCredsFrom(user); ok {
+			path := ""
+			if ev.CaldavPath != nil {
+				path = *ev.CaldavPath
+			}
+			c := caldav.New()
+			if err := c.DeleteEvent(ctx, login, pass, cfg.CaldavURL, path, *ev.CaldavUID); err != nil {
+				fmt.Printf("  [cleanup] apple: %v\n", err)
+			}
+		}
+		if _, err := store.DeleteEvent(ctx, userID, ev.ID); err != nil {
+			fmt.Printf("  [cleanup] db: %v\n", err)
+		}
+	}
+	if len(left) > 0 {
+		fmt.Printf("  [cleanup] убрано хвостов: %d\n", len(left))
+	}
+}
+
+// caldavCredsFrom — учётные данные (пароль уже расшифрован на уровне storage).
+func caldavCredsFrom(u *storage.User) (string, string, bool) {
+	if u.CaldavLogin == nil || u.CaldavPassword == nil {
+		return "", "", false
+	}
+	if *u.CaldavLogin == "" || *u.CaldavPassword == "" {
+		return "", "", false
+	}
+	return *u.CaldavLogin, *u.CaldavPassword, true
 }
 
 // checkApple — GET события по UID: 200 = лежит, 404 = удалено.

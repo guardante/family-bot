@@ -54,15 +54,102 @@ func (c *Client) Chat(ctx context.Context, messages []Message) (string, error) {
 	return c.ChatWithTemperature(ctx, messages, 0.7, 900)
 }
 
-// ChatWithTemperature — то же, но с управлением температурой и лимитом токенов
-// (пониженная температура нужна для надёжного JSON в роутере намерений).
+// ChatWithTemperature — то же, но с управлением температурой и лимитом токенов.
+// thinking отключён: reasoning-модели могут потратить весь лимит на
+// внутренние рассуждения и вернуть пустой content.
 func (c *Client) ChatWithTemperature(ctx context.Context, messages []Message, temperature float64, maxTokens int) (string, error) {
 	return c.doChat(ctx, map[string]any{
 		"model":       c.model,
 		"messages":    messages,
 		"temperature": temperature,
 		"max_tokens":  maxTokens,
+		"thinking":    map[string]string{"type": "disabled"},
 	})
+}
+
+// ---- нативный function calling (tools) ----
+
+type Tool struct {
+	Type     string       `json:"type"`
+	Function ToolFunction `json:"function"`
+}
+
+type ToolFunction struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
+}
+
+type ToolCall struct {
+	ID       string `json:"id"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+// ToolsChat отправляет диалог с описанием доступных инструментов.
+// Возвращает текстовый ответ (если модель просто говорит) и вызовы инструментов.
+func (c *Client) ToolsChat(ctx context.Context, messages []Message, tools []Tool) (string, []ToolCall, error) {
+	payload := map[string]any{
+		"model":       c.model,
+		"messages":    messages,
+		"tools":       tools,
+		"tool_choice": "auto",
+		"temperature": 0.2,
+		"max_tokens":  2000,
+		"thinking":    map[string]string{"type": "disabled"},
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.baseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return "", nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", nil, fmt.Errorf("запрос к GLM: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return "", nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", nil, fmt.Errorf("GLM API: статус %d: %s", resp.StatusCode, truncate(string(raw), 300))
+	}
+
+	var parsed struct {
+		Choices []struct {
+			Message struct {
+				Content   string     `json:"content"`
+				ToolCalls []ToolCall `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return "", nil, fmt.Errorf("ответ GLM не разобрать: %w", err)
+	}
+	if parsed.Error != nil && parsed.Error.Message != "" {
+		return "", nil, fmt.Errorf("GLM API: %s", parsed.Error.Message)
+	}
+	if len(parsed.Choices) == 0 {
+		return "", nil, fmt.Errorf("GLM API: пустой ответ")
+	}
+
+	msg := parsed.Choices[0].Message
+	return strings.TrimSpace(msg.Content), msg.ToolCalls, nil
 }
 
 // VisionChat отправляет изображение (data URL) с инструкцией и возвращает ответ.
