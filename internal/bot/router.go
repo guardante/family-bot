@@ -21,7 +21,7 @@ var weekdaysRU = [...]string{"воскресенье", "понедельник",
 const routerPromptFmt = `Ты — Надя, ассистентка в Telegram-боте. Твоя задача — понять намерение пользователя и выбрать действие. Верни СТРОГО один JSON-объект, без markdown и пояснений.
 
 Действия:
-{"action":"add","events":[{"title":"...","date":"YYYY-MM-DD","time":"HH:MM"}],"todos":["текст задачи"]} — записать. events — события с датой и временем (встречи, напоминания вида «напомни завтра в 7»); todos — задачи без даты и времени (списки, «не забыть купить»). Заполняй только подходящие поля; оба массива могут быть в одном ответе.
+{"action":"add","events":[{"title":"...","date":"YYYY-MM-DD","time":"HH:MM"}],"todos":["текст задачи"]} — записать. events — события с датой и временем (встречи, напоминания вида «напомни завтра в 7»); todos — задачи без даты и времени (списки, «не забыть купить»). Если у события не названо время — ставь 09:00. Заполняй только подходящие поля; оба массива могут быть в одном ответе.
 {"action":"show_weather"} — спрашивают про погоду
 {"action":"show_events"} — показать записанные события
 {"action":"show_todos"} — показать список дел
@@ -206,6 +206,7 @@ func (b *Bot) execAdd(ctx context.Context, chatID int64, user *storage.User, act
 	if err != nil {
 		loc = time.UTC
 	}
+	now := time.Now().In(loc)
 
 	var lines []string
 	var notes []string
@@ -215,7 +216,11 @@ func (b *Bot) execAdd(ctx context.Context, chatID int64, user *storage.User, act
 		if title == "" {
 			continue
 		}
-		at, err := time.ParseInLocation("2006-01-02 15:04", ev.Date+" "+ev.Time, loc)
+		// Дублируем подстраховку модели на случай, если она вернула пустое время.
+		if ev.Time == "" {
+			ev.Time = defaultEventTime
+		}
+		at, err := lenientDateTime(ev.Date, ev.Time, loc, now)
 		if err != nil {
 			slog.Warn("router event time", "date", ev.Date, "time", ev.Time, "err", err)
 			continue
