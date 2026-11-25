@@ -44,7 +44,10 @@ func (c *Client) Validate(ctx context.Context, login, password, endpoint string)
 	return nil
 }
 
-// findCalendarPath возвращает путь календаря: с именем name, иначе первый.
+// findCalendarPath возвращает путь календаря для событий:
+// приоритет — календарь с именем name («Надя»), иначе первый записываемый,
+// который принимает VEVENT. Списки Reminders у iCloud отдают только VTODO —
+// запись VEVENT в них даёт 403, поэтому фильтруем по SupportedComponentSet.
 func (c *Client) findCalendarPath(ctx context.Context, cl *caldav.Client, principal, name string) (string, error) {
 	home, err := cl.FindCalendarHomeSet(ctx, principal)
 	if err != nil {
@@ -54,19 +57,34 @@ func (c *Client) findCalendarPath(ctx context.Context, cl *caldav.Client, princi
 	if err != nil {
 		return "", fmt.Errorf("список календарей: %w", err)
 	}
-	var first string
+	fallback := ""
 	for _, cal := range calendars {
-		if first == "" {
-			first = cal.Path
+		if !supportsEvents(cal) {
+			continue
 		}
 		if strings.EqualFold(cal.Name, name) {
 			return cal.Path, nil
 		}
+		if fallback == "" {
+			fallback = cal.Path
+		}
 	}
-	if first == "" {
-		return "", errors.New("не найдено ни одного календаря")
+	if fallback != "" {
+		return fallback, nil
 	}
-	return first, nil
+	return "", errors.New("нет подходящего календаря для событий (только списки напоминаний?)")
+}
+
+func supportsEvents(cal caldav.Calendar) bool {
+	if cal.ReadOnly {
+		return false
+	}
+	for _, comp := range cal.SupportedComponentSet {
+		if strings.EqualFold(comp, "VEVENT") {
+			return true
+		}
+	}
+	return false
 }
 
 // PutEvent создаёт (или перезаписывает) событие и возвращает UID.
@@ -100,7 +118,7 @@ func (c *Client) PutEvent(ctx context.Context, login, password, endpoint, calend
 
 	objPath := strings.TrimSuffix(path, "/") + "/" + uid + ".ics"
 	if _, err := cl.PutCalendarObject(ctx, objPath, cal, nil); err != nil {
-		return "", fmt.Errorf("запись события: %w", err)
+		return "", fmt.Errorf("запись события (календарь %s): %w", path, err)
 	}
 	return uid, nil
 }
@@ -135,3 +153,6 @@ func BuildICS(title string, at time.Time) []byte {
 	_ = ical.NewEncoder(&buf).Encode(cal)
 	return buf.Bytes()
 }
+
+// NewHTTP открывает http.Client для внешней диагностики (тесты).
+func (c *Client) NewHTTP() *http.Client { return c.http }

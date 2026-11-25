@@ -3,7 +3,10 @@ package storage
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"nadia_bot/internal/secrets"
 )
 
 func TestSQLiteFullCycle(t *testing.T) {
@@ -22,7 +25,7 @@ func TestSQLiteFullCycle(t *testing.T) {
 		t.Fatalf("migrate idempotent: %v", err)
 	}
 
-	s := New(db)
+	s := New(db, secrets.New("test-master-key"))
 
 	// --- создание пользователя ---
 	u, err := s.EnsureUser(ctx, 42, "tester", "Тест")
@@ -194,10 +197,38 @@ func TestSQLiteFullCycle(t *testing.T) {
 	if u, _ = s.GetUser(ctx, 42); u.TodoistToken == nil || *u.TodoistToken != "secret-token" {
 		t.Fatalf("todoist token: %+v", u)
 	}
+	// В базе лежит шифротекст, а не открытый текст.
+	var stored string
+	if err := db.QueryRowContext(ctx, `SELECT todoist_token FROM users WHERE id = 42`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored == "secret-token" || !strings.HasPrefix(stored, "enc:v1:") {
+		t.Fatalf("токен должен быть зашифрован, получено: %q", stored)
+	}
 	if err := s.SetTodoistToken(ctx, 42, ""); err != nil {
 		t.Fatal(err)
 	}
 	if u, _ = s.GetUser(ctx, 42); u.TodoistToken != nil {
 		t.Fatalf("todoist token not cleared: %+v", u)
+	}
+
+	// --- перешифрование легаси-открытого текста ---
+	if _, err := db.ExecContext(ctx,
+		`UPDATE users SET caldav_login = 'user@icloud.com', caldav_password = 'plain-legacy' WHERE id = 42`); err != nil {
+		t.Fatal(err)
+	}
+	fixed, err := s.ReencryptSecrets(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fixed != 1 {
+		t.Fatalf("reencrypt: fixed=%d", fixed)
+	}
+	u, err = s.GetUser(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.CaldavLogin == nil || *u.CaldavLogin != "user@icloud.com" || u.CaldavPassword == nil || *u.CaldavPassword != "plain-legacy" {
+		t.Fatalf("легаси-секрет не расшифровался: %+v", u)
 	}
 }

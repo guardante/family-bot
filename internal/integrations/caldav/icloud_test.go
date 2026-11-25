@@ -1,0 +1,41 @@
+package caldav
+
+// Разовая проверка против реального iCloud. Запуск:
+//   ICLOUD_LOGIN=... ICLOUD_PASS=... go test ./internal/integrations/caldav/ -run TestIcloud -v
+// Создаёт тестовое событие и сразу удаляет его.
+
+import (
+	"context"
+	"os"
+	"testing"
+	"time"
+)
+
+func TestIcloudPush(t *testing.T) {
+	login := os.Getenv("ICLOUD_LOGIN")
+	pass := os.Getenv("ICLOUD_PASS")
+	if login == "" || pass == "" {
+		t.Skip("ICLOUD_LOGIN/ICLOUD_PASS не заданы")
+	}
+
+	c := New()
+	ctx := context.Background()
+
+	if err := c.Validate(ctx, login, pass, "https://caldav.icloud.com"); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	t.Log("валидация ок")
+
+	at := time.Now().Add(24 * time.Hour).Truncate(time.Minute)
+	uid, err := c.PutEvent(ctx, login, pass, "https://caldav.icloud.com", "Надя", "Тест Надя (проверка)", at)
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	t.Logf("событие записано, uid=%s", uid)
+
+	if err := c.DeleteEvent(ctx, login, pass, "https://caldav.icloud.com", "Надя", uid); err != nil {
+		t.Logf("удаление: %v (событие можно убрать вручную)", err)
+	} else {
+		t.Log("удаление ок")
+	}
+}

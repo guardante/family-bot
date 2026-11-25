@@ -34,6 +34,9 @@ type Config struct {
 	GLMModel       string
 	GLMVisionModel string // модель с поддержкой картинок (распознавание текста с фото)
 
+	// Шифрование секретов в базе (токены, пароли приложений). Пусто — выводится из BOT_TOKEN.
+	EncryptionKey string
+
 	// Postgres -> SQLite: путь к файлу базы
 	SQLitePath string
 
@@ -48,6 +51,7 @@ func Load() (*Config, error) {
 		GLMBaseURL:     getenv("GLM_BASE_URL", "https://api.z.ai/api/paas/v4"),
 		GLMModel:       getenv("GLM_MODEL", "glm-4.5-flash"),
 		GLMVisionModel: getenv("GLM_VISION_MODEL", "glm-4.5v"),
+		EncryptionKey:  strings.TrimSpace(os.Getenv("ENCRYPTION_KEY")),
 		SQLitePath:     getenv("SQLITE_PATH", "data/nadia.db"),
 		HistoryLimit:   16,
 		WebAppURL:      strings.TrimRight(strings.TrimSpace(os.Getenv("WEBAPP_URL")), "/"),

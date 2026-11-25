@@ -4,6 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
+
+	"nadia_bot/internal/secrets"
 )
 
 // Состояния онбординга и диалогов пользователя.
@@ -35,10 +38,16 @@ type User struct {
 
 func (u *User) HasCity() bool { return u.CityName != nil }
 
-type Storage struct{ db *sql.DB }
+type Storage struct {
+	db     *sql.DB
+	cipher *secrets.Cipher
+}
 
-func New(db *sql.DB) *Storage {
-	return &Storage{db: db}
+func New(db *sql.DB, cipher *secrets.Cipher) *Storage {
+	if cipher == nil {
+		cipher = secrets.New("")
+	}
+	return &Storage{db: db, cipher: cipher}
 }
 
 const userCols = `id, username, first_name, city_name, city_lat, city_lon,
@@ -77,7 +86,20 @@ func (s *Storage) GetUser(ctx context.Context, id int64) (*User, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.decryptUser(u)
 	return u, nil
+}
+
+// decryptUser расшифровывает секретные поля после чтения из базы.
+func (s *Storage) decryptUser(u *User) {
+	if u.TodoistToken != nil {
+		dec := s.cipher.Decrypt(*u.TodoistToken)
+		u.TodoistToken = &dec
+	}
+	if u.CaldavPassword != nil {
+		dec := s.cipher.Decrypt(*u.CaldavPassword)
+		u.CaldavPassword = &dec
+	}
 }
 
 // UpdateCity сохраняет город и помечает сегодняшнюю рассылку отправленной:
@@ -126,7 +148,7 @@ func (s *Storage) MarkDailySent(ctx context.Context, id int64, date string) erro
 func (s *Storage) SetTodoistToken(ctx context.Context, id int64, token string) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE users SET todoist_token = NULLIF(?, ''), updated_at = datetime('now')
-		WHERE id = ?`, token, id)
+		WHERE id = ?`, s.cipher.Encrypt(token), id)
 	return err
 }
 
@@ -136,8 +158,60 @@ func (s *Storage) SetCaldavAuth(ctx context.Context, id int64, login, password s
 		UPDATE users
 		SET caldav_login = NULLIF(?, ''), caldav_password = NULLIF(?, ''),
 			updated_at = datetime('now')
-		WHERE id = ?`, login, password, id)
+		WHERE id = ?`, login, s.cipher.Encrypt(password), id)
 	return err
+}
+
+// ReencryptSecrets переносит секреты из легаси-открытого текста в шифрованный
+// вид. Вызывается на старте; безопасно запускать повторно.
+func (s *Storage) ReencryptSecrets(ctx context.Context) (int, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, todoist_token, caldav_password FROM users
+		WHERE todoist_token IS NOT NULL OR caldav_password IS NOT NULL`)
+	if err != nil {
+		return 0, err
+	}
+	type row struct {
+		id    int64
+		token string
+		pass  string
+	}
+	var toFix []row
+	for rows.Next() {
+		var r row
+		var token, pass *string
+		if err := rows.Scan(&r.id, &token, &pass); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		if token != nil {
+			r.token = *token
+		}
+		if pass != nil {
+			r.pass = *pass
+		}
+		// шифруем только те, что ещё не в формате enc:v1:
+		if strings.HasPrefix(r.token, "enc:v1:") && strings.HasPrefix(r.pass, "enc:v1:") {
+			continue
+		}
+		toFix = append(toFix, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	fixed := 0
+	for _, r := range toFix {
+		_, err := s.db.ExecContext(ctx, `
+			UPDATE users SET todoist_token = ?, caldav_password = ? WHERE id = ?`,
+			s.cipher.Encrypt(r.token), s.cipher.Encrypt(r.pass), r.id)
+		if err != nil {
+			return fixed, err
+		}
+		fixed++
+	}
+	return fixed, nil
 }
 
 // DailyUsers — те, кому нужно отправлять утренний прогноз.
@@ -161,6 +235,7 @@ func (s *Storage) DailyUsers(ctx context.Context) ([]User, error) {
 			return nil, err
 		}
 		users = append(users, u)
+		s.decryptUser(&users[len(users)-1])
 	}
 	return users, rows.Err()
 }

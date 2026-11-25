@@ -20,9 +20,18 @@ import (
 	"nadia_bot/internal/glm"
 	"nadia_bot/internal/integrations"
 	"nadia_bot/internal/integrations/todoist"
+	"nadia_bot/internal/secrets"
 	"nadia_bot/internal/storage"
 	"nadia_bot/internal/web"
 )
+
+// masterKey — ключ шифрования секретов: ENCRYPTION_KEY или вывод из BOT_TOKEN.
+func masterKey(cfg *config.Config) string {
+	if cfg.EncryptionKey != "" {
+		return cfg.EncryptionKey
+	}
+	return cfg.BotToken
+}
 
 const numWorkers = 4
 
@@ -49,6 +58,11 @@ func main() {
 		slog.Error("миграции", "err", err)
 		os.Exit(1)
 	}
+	if fixed, err := storage.New(db, secrets.New(masterKey(cfg))).ReencryptSecrets(ctx); err != nil {
+		slog.Error("перешифрование секретов", "err", err)
+	} else if fixed > 0 {
+		slog.Info("секреты перенесены в шифрованный вид", "users", fixed)
+	}
 
 	api, err := tgbotapi.NewBotAPI(cfg.BotToken)
 	if err != nil {
@@ -57,7 +71,15 @@ func main() {
 	}
 	slog.Info("бот запущен", "username", api.Self.UserName, "model", cfg.GLMModel)
 
-	store := storage.New(db)
+	// Шифрование секретов в базе. Мастер-ключ: ENCRYPTION_KEY, а без неё —
+	// выводим из BOT_TOKEN (база без .env в отрыве бесполезна).
+	master := masterKey(cfg)
+	if cfg.EncryptionKey == "" {
+		slog.Warn("ENCRYPTION_KEY не задан — использую ключ из BOT_TOKEN. Рекомендую задать отдельный ENCRYPTION_KEY.")
+	}
+	cipher := secrets.New(master)
+
+	store := storage.New(db, cipher)
 	registry := integrations.NewRegistry(todoist.New())
 	b := bot.New(cfg, api, store,
 		glm.New(cfg.GLMAPIKey, cfg.GLMBaseURL, cfg.GLMModel, cfg.GLMVisionModel),
