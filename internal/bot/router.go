@@ -28,7 +28,10 @@ const routerPromptFmt = `Ты — Надя, ассистентка в Telegram-�
 {"action":"set_city","city":"..."} — пользователь сменил или назвал свой город
 {"action":"set_daily_time","time":"ЧЧ:ММ"} — изменить время утреннего сообщения
 {"action":"delete_event","title":"часть названия"} — удалить событие
+{"action":"move_event","title":"часть названия","date":"YYYY-MM-DD","time":"HH:MM"} — перенести событие на другую дату/время. Если время не названо — сохрани прежнее время события (время вернёшь то же, что было).
 {"action":"chat","reply":"..."} — всё остальное: вопросы, болтовня; reply — твой короткий живой ответ на языке пользователя. Погоду внутри chat не выдумывай — предлагай показать.
+
+Правило честности: доступен ТОЛЬКО этот список действий. Не изображай выполнение: если просьба не покрывается действиями (изменить название, отредактировать задачу и т.п.) — верни {"action":"chat"} и честно скажи, что этого пока не умеешь.
 
 Контекст:
 — Сегодня: %s (%s), время %s, часовой пояс пользователя: %s
@@ -40,6 +43,7 @@ type routerAction struct {
 	Reply  string `json:"reply"`
 	City   string `json:"city"`
 	Time   string `json:"time"`
+	Date   string `json:"date"`
 	Title  string `json:"title"`
 	Events []struct {
 		Title string `json:"title"`
@@ -196,6 +200,8 @@ func (b *Bot) execAction(ctx context.Context, chatID int64, user *storage.User, 
 		return "[время утреннего сообщения: " + hhmm + "]"
 	case "delete_event":
 		return b.execDeleteEvent(ctx, chatID, user, action.Title)
+	case "move_event":
+		return b.execMoveEvent(ctx, chatID, user, action)
 	default:
 		return ""
 	}
@@ -329,6 +335,87 @@ func (b *Bot) execDeleteEvent(ctx context.Context, chatID int64, user *storage.U
 		b.reply(ctx, chatID, "Удалила: "+deleted.Title)
 		return "[удалила событие: " + deleted.Title + "]"
 	}
+	b.reply(ctx, chatID, fmt.Sprintf("Не нашла среди событий ничего про «%s» 🤔 Посмотри список: /events", title))
+	return "[событие не найдено]"
+}
+
+// execMoveEvent — «перенеси событие X на завтра / на 17:00».
+func (b *Bot) execMoveEvent(ctx context.Context, chatID int64, user *storage.User, action *routerAction) string {
+	title := strings.TrimSpace(action.Title)
+	if title == "" {
+		b.reply(ctx, chatID, "Скажи, какое событие перенести — хотя бы часть названия 🙏")
+		return "[не поняла, что переносить]"
+	}
+	if action.Date == "" && action.Time == "" {
+		b.reply(ctx, chatID, "На какую дату или время перенести? Например: «перенеси встречу на завтра» или «…на 17:00»")
+		return "[не поняла, куда переносить]"
+	}
+
+	events, err := b.upcomingEvents(ctx, user, 50)
+	if err != nil {
+		slog.Error("events list", "err", err)
+		b.reply(ctx, chatID, "Не получилось загрузить события 😔")
+		return ""
+	}
+
+	needle := strings.ToLower(title)
+	for _, ev := range events {
+		if !strings.Contains(strings.ToLower(ev.Title), needle) {
+			continue
+		}
+		oldAt, err := storage.ParseEventAt(ev.EventAt)
+		if err != nil {
+			continue
+		}
+
+		loc, err := time.LoadLocation(user.Timezone)
+		if err != nil {
+			loc = time.UTC
+		}
+		now := time.Now().In(loc)
+		oldLocal := oldAt.In(loc)
+
+		// Новая дата: названа — берём её; не названа — оставляем прежний день.
+		day := oldLocal
+		if action.Date != "" {
+			day, err = lenientDate(action.Date, loc, now)
+			if err != nil {
+				b.reply(ctx, chatID, "Не поняла дату 🤔 "+err.Error())
+				return "[не поняла дату]"
+			}
+		}
+		// Новое время: названо — берём его; не названо — сохраняем прежнее.
+		hour, minute := oldLocal.Hour(), oldLocal.Minute()
+		if action.Time != "" {
+			hour, minute, err = lenientTime(action.Time)
+			if err != nil {
+				b.reply(ctx, chatID, "Не поняла время 🤔 "+err.Error())
+				return "[не поняла время]"
+			}
+		}
+		newAt := time.Date(day.Year(), day.Month(), day.Day(), hour, minute, 0, 0, loc)
+
+		if err := b.store.UpdateEventAt(ctx, user.ID, ev.ID, storage.NormalizeEventAt(newAt)); err != nil {
+			slog.Error("move event", "err", err)
+			b.reply(ctx, chatID, "Не получилось перенести 😔")
+			return ""
+		}
+		if ev.CaldavUID != nil {
+			if login, pass, ok := caldavCreds(user); ok {
+				if err := b.caldav.UpdateEvent(ctx, login, pass, b.cfg.CaldavURL, "Надя", *ev.CaldavUID, ev.Title, newAt); err != nil {
+					slog.Warn("caldav move", "err", err)
+					b.reply(ctx, chatID, fmt.Sprintf("Перенесла локально, но в календаре Apple не обновилось: %v", err))
+					return "[перенесла локально, caldav ошибка]"
+				}
+			}
+		}
+		b.reply(ctx, chatID, fmt.Sprintf("Перенесла «%s»: %s → %s",
+			ev.Title,
+			oldLocal.Format("02.01 в 15:04"),
+			newAt.Format("02.01 в 15:04")))
+		return "[перенесла: " + ev.Title + " на " + newAt.Format("02.01 15:04") + "]"
+	}
+
 	b.reply(ctx, chatID, fmt.Sprintf("Не нашла среди событий ничего про «%s» 🤔 Посмотри список: /events", title))
 	return "[событие не найдено]"
 }

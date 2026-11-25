@@ -84,6 +84,14 @@ func (s *Storage) DeleteEvent(ctx context.Context, userID, eventID int64) (*Even
 	return ev, nil
 }
 
+// UpdateEventAt переносит событие на новое время и перезапускает напоминание.
+func (s *Storage) UpdateEventAt(ctx context.Context, userID, eventID int64, atUTC string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE events SET event_at = ?, notified = 0 WHERE user_id = ? AND id = ?`,
+		atUTC, userID, eventID)
+	return err
+}
+
 // SetEventCaldavUID привязывает событие к событию в календаре Apple.
 func (s *Storage) SetEventCaldavUID(ctx context.Context, userID, eventID int64, uid string) error {
 	_, err := s.db.ExecContext(ctx, `

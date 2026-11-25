@@ -89,6 +89,16 @@ func supportsEvents(cal caldav.Calendar) bool {
 
 // PutEvent создаёт (или перезаписывает) событие и возвращает UID.
 func (c *Client) PutEvent(ctx context.Context, login, password, endpoint, calendarName, title string, at time.Time) (string, error) {
+	return c.putEvent(ctx, login, password, endpoint, calendarName, "", title, at)
+}
+
+// UpdateEvent перезаписывает событие с известным UID (перенос на другое время).
+func (c *Client) UpdateEvent(ctx context.Context, login, password, endpoint, calendarName, uid, title string, at time.Time) error {
+	_, err := c.putEvent(ctx, login, password, endpoint, calendarName, uid, title, at)
+	return err
+}
+
+func (c *Client) putEvent(ctx context.Context, login, password, endpoint, calendarName, uid, title string, at time.Time) (string, error) {
 	cl, err := c.client(ctx, login, password, endpoint)
 	if err != nil {
 		return "", err
@@ -102,7 +112,9 @@ func (c *Client) PutEvent(ctx context.Context, login, password, endpoint, calend
 		return "", err
 	}
 
-	uid := "nadia-" + strconv.FormatInt(time.Now().UnixNano(), 10) + "@nadia.bot"
+	if uid == "" {
+		uid = "nadia-" + strconv.FormatInt(time.Now().UnixNano(), 10) + "@nadia.bot"
+	}
 
 	cal := ical.NewCalendar()
 	cal.Props.SetText(ical.PropVersion, "2.0")
