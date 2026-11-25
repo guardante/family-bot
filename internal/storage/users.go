@@ -6,11 +6,13 @@ import (
 	"errors"
 )
 
-// Состояния онбординга пользователя.
+// Состояния онбординга и диалогов пользователя.
 const (
-	StateNone         = ""
-	StateAwaitingCity = "awaiting_city"
-	StateAwaitingTime = "awaiting_time"
+	StateNone            = ""
+	StateAwaitingCity    = "awaiting_city"
+	StateAwaitingTime    = "awaiting_time"
+	StateAwaitingTodo    = "awaiting_todo"
+	StateAwaitingTodoist = "awaiting_todoist_token"
 )
 
 type User struct {
@@ -25,6 +27,7 @@ type User struct {
 	DailyEnabled  bool
 	LastDailyDate *string // "ГГГГ-ММ-ДД", когда последний раз отправляли утренний прогноз
 	State         string
+	TodoistToken  *string // персональный API-токен Todoist (опциональная интеграция)
 }
 
 func (u *User) HasCity() bool { return u.CityName != nil }
@@ -36,7 +39,7 @@ func New(db *sql.DB) *Storage {
 }
 
 const userCols = `id, username, first_name, city_name, city_lat, city_lon,
-	timezone, daily_time, daily_enabled, last_daily_date, state`
+	timezone, daily_time, daily_enabled, last_daily_date, state, todoist_token`
 
 // EnsureUser создаёт пользователя, если его нет, и обновляет имя/юзернейм.
 func (s *Storage) EnsureUser(ctx context.Context, id int64, username, firstName string) (*User, error) {
@@ -61,7 +64,7 @@ func (s *Storage) GetUser(ctx context.Context, id int64) (*User, error) {
 		`SELECT `+userCols+` FROM users WHERE id = ?`, id,
 	).Scan(
 		&u.ID, &u.Username, &u.FirstName, &u.CityName, &u.CityLat, &u.CityLon,
-		&u.Timezone, &u.DailyTime, &u.DailyEnabled, &u.LastDailyDate, &u.State,
+		&u.Timezone, &u.DailyTime, &u.DailyEnabled, &u.LastDailyDate, &u.State, &u.TodoistToken,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -115,6 +118,13 @@ func (s *Storage) MarkDailySent(ctx context.Context, id int64, date string) erro
 	return err
 }
 
+func (s *Storage) SetTodoistToken(ctx context.Context, id int64, token string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE users SET todoist_token = NULLIF(?, ''), updated_at = datetime('now')
+		WHERE id = ?`, token, id)
+	return err
+}
+
 // DailyUsers — те, кому нужно отправлять утренний прогноз.
 func (s *Storage) DailyUsers(ctx context.Context) ([]User, error) {
 	rows, err := s.db.QueryContext(ctx, `
@@ -130,7 +140,7 @@ func (s *Storage) DailyUsers(ctx context.Context) ([]User, error) {
 		var u User
 		if err := rows.Scan(
 			&u.ID, &u.Username, &u.FirstName, &u.CityName, &u.CityLat, &u.CityLon,
-			&u.Timezone, &u.DailyTime, &u.DailyEnabled, &u.LastDailyDate, &u.State,
+			&u.Timezone, &u.DailyTime, &u.DailyEnabled, &u.LastDailyDate, &u.State, &u.TodoistToken,
 		); err != nil {
 			return nil, err
 		}

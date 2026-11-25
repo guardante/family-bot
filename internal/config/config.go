@@ -16,9 +16,10 @@ type Config struct {
 	AllowedIDs []int64
 
 	// GLM (OpenAI-совместимый API)
-	GLMAPIKey  string
-	GLMBaseURL string
-	GLMModel   string
+	GLMAPIKey      string
+	GLMBaseURL     string
+	GLMModel       string
+	GLMVisionModel string // модель с поддержкой картинок (распознавание текста с фото)
 
 	// Postgres -> SQLite: путь к файлу базы
 	SQLitePath string
@@ -29,12 +30,13 @@ type Config struct {
 
 func Load() (*Config, error) {
 	cfg := &Config{
-		BotToken:     strings.TrimSpace(os.Getenv("BOT_TOKEN")),
-		GLMAPIKey:    strings.TrimSpace(os.Getenv("GLM_API_KEY")),
-		GLMBaseURL:   getenv("GLM_BASE_URL", "https://api.z.ai/api/paas/v4"),
-		GLMModel:     getenv("GLM_MODEL", "glm-4.5-flash"),
-		SQLitePath:   getenv("SQLITE_PATH", "data/nadia.db"),
-		HistoryLimit: 16,
+		BotToken:       strings.TrimSpace(os.Getenv("BOT_TOKEN")),
+		GLMAPIKey:      strings.TrimSpace(os.Getenv("GLM_API_KEY")),
+		GLMBaseURL:     getenv("GLM_BASE_URL", "https://api.z.ai/api/paas/v4"),
+		GLMModel:       getenv("GLM_MODEL", "glm-4.5-flash"),
+		GLMVisionModel: getenv("GLM_VISION_MODEL", "glm-4.5v"),
+		SQLitePath:     getenv("SQLITE_PATH", "data/nadia.db"),
+		HistoryLimit:   16,
 	}
 
 	if cfg.BotToken == "" {

@@ -1,4 +1,4 @@
-// Package bot: обработка сообщений Telegram, онбординг и чат с LLM.
+// Package bot: обработка сообщений Telegram, онбординг, чат с LLM, меню и дела.
 package bot
 
 import (
@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 
 	"nadia_bot/internal/config"
 	"nadia_bot/internal/glm"
+	"nadia_bot/internal/integrations"
 	"nadia_bot/internal/storage"
 	"nadia_bot/internal/weather"
 )
@@ -28,32 +31,41 @@ type Bot struct {
 	store   *storage.Storage
 	llm     *glm.Client
 	weather *weather.Client
+	apps    *integrations.Registry
+	http    *http.Client // скачивание фото из Telegram
 }
 
-func New(cfg *config.Config, api *tgbotapi.BotAPI, store *storage.Storage, llm *glm.Client) *Bot {
+func New(cfg *config.Config, api *tgbotapi.BotAPI, store *storage.Storage,
+	llm *glm.Client, apps *integrations.Registry) *Bot {
 	return &Bot{
 		cfg:     cfg,
 		api:     api,
 		store:   store,
 		llm:     llm,
 		weather: weather.New(),
+		apps:    apps,
+		http:    &http.Client{Timeout: 60 * time.Second},
 	}
 }
 
 func (b *Bot) SetCommands(ctx context.Context) error {
 	_, err := b.api.Request(tgbotapi.NewSetMyCommands(
+		tgbotapi.BotCommand{Command: "todos", Description: "Список дел"},
 		tgbotapi.BotCommand{Command: "weather", Description: "Погода сейчас"},
 		tgbotapi.BotCommand{Command: "city", Description: "Сменить город"},
 		tgbotapi.BotCommand{Command: "time", Description: "Время утренней погоды"},
-		tgbotapi.BotCommand{Command: "on", Description: "Включить утреннюю погоду"},
-		tgbotapi.BotCommand{Command: "off", Description: "Выключить утреннюю погоду"},
 		tgbotapi.BotCommand{Command: "forget", Description: "Забыть наш разговор"},
+		tgbotapi.BotCommand{Command: "settings", Description: "Настройки"},
 		tgbotapi.BotCommand{Command: "help", Description: "Что я умею"},
 	))
 	return err
 }
 
 func (b *Bot) HandleUpdate(ctx context.Context, upd tgbotapi.Update) {
+	if upd.CallbackQuery != nil {
+		b.handleCallback(ctx, upd.CallbackQuery)
+		return
+	}
 	if upd.Message == nil || upd.Message.From == nil {
 		return
 	}
@@ -70,9 +82,15 @@ func (b *Bot) HandleUpdate(ctx context.Context, upd tgbotapi.Update) {
 		return
 	}
 
+	// Фото (и картинки документом) — распознавание текста.
+	if msg.Photo != nil || isImageDocument(msg.Document) {
+		b.handlePhoto(ctx, msg)
+		return
+	}
+
 	text := strings.TrimSpace(msg.Text)
 	if text == "" {
-		b.reply(ctx, msg.Chat.ID, "Я понимаю только текст 🙂")
+		b.reply(ctx, msg.Chat.ID, "Я понимаю текст и фото 🙂")
 		return
 	}
 
@@ -81,14 +99,42 @@ func (b *Bot) HandleUpdate(ctx context.Context, upd tgbotapi.Update) {
 		return
 	}
 
+	// Кнопки постоянного меню работают в любом состоянии.
+	if b.handleMenuButton(ctx, msg.Chat.ID, user, text) {
+		return
+	}
+
 	switch user.State {
 	case storage.StateAwaitingCity:
 		b.handleCityInput(ctx, msg.Chat.ID, user, text)
 	case storage.StateAwaitingTime:
 		b.handleTimeInput(ctx, msg.Chat.ID, user, text)
+	case storage.StateAwaitingTodo:
+		b.addTodoFromText(ctx, msg.Chat.ID, user, text)
+	case storage.StateAwaitingTodoist:
+		b.connectTodoist(ctx, msg.Chat.ID, user, text)
 	default:
 		b.handleChat(ctx, msg.Chat.ID, user, text)
 	}
+}
+
+func isImageDocument(doc *tgbotapi.Document) bool {
+	return doc != nil && strings.HasPrefix(doc.MimeType, "image/")
+}
+
+// handleMenuButton обрабатывает постоянную клавиатуру.
+func (b *Bot) handleMenuButton(ctx context.Context, chatID int64, user *storage.User, text string) bool {
+	switch text {
+	case "🌤 Погода":
+		b.cmdWeather(ctx, chatID, user)
+	case "📝 Дела":
+		b.cmdTodos(ctx, chatID, user)
+	case "⚙️ Настройки":
+		b.cmdSettings(ctx, chatID, user)
+	default:
+		return false
+	}
+	return true
 }
 
 func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message, user *storage.User) {
@@ -96,74 +142,90 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message, user *st
 
 	switch msg.Command() {
 	case "start":
-		if user.HasCity() {
-			b.reply(ctx, chatID, fmt.Sprintf(
-				"С возвращением, %s! 👋 Город: %s, погода приходит каждый день в %s.\nСпроси меня о чём-нибудь или /weather.",
-				firstName(user), *user.CityName, user.DailyTime))
-			return
-		}
-		b.reply(ctx, chatID, fmt.Sprintf("Привет, %s! 👋 Я Надя — твой персональный бот.\nБуду каждое утро присылать погоду и отвечать на вопросы.", firstName(user)))
-		b.askCity(ctx, chatID, user.ID)
-
+		b.cmdStart(ctx, chatID, user)
 	case "help":
 		b.reply(ctx, chatID, "Вот что я умею:\n"+
 			"• /weather — погода на сегодня\n"+
+			"• /todos — список дел (и фото с текстом тоже можно!)\n"+
 			"• /city — сменить город\n"+
 			"• /time — во сколько присылать утреннюю погоду\n"+
-			"• /on, /off — включить/выключить утреннюю погоду\n"+
-			"• /forget — забыть наш разговор\n\n"+
-			"А ещё просто пиши мне — отвечу на вопросы 🙂")
+			"• /settings — настройки и интеграции\n"+
+			"• /forget — забыть наш разговор\n"+
+			"• /cancel — выйти из текущего вопроса\n\n"+
+			"Пришли фото с текстом — распознаю. Просто пиши мне — отвечу на вопросы 🙂")
 
 	case "city":
-		b.askCity(ctx, chatID, user.ID)
-
+		b.cmdCity(ctx, chatID, user)
 	case "time":
-		if !user.HasCity() {
-			b.askCity(ctx, chatID, user.ID)
-			return
-		}
-		if err := b.store.SetState(ctx, user.ID, storage.StateAwaitingTime); err != nil {
-			slog.Error("set state", "err", err)
-			return
-		}
-		b.reply(ctx, chatID, fmt.Sprintf(
-			"Сейчас присылаю погоду в %s ⏰\nВо сколько присылать? Напиши время в формате ЧЧ:ММ, например 08:00.",
-			user.DailyTime))
-
+		b.cmdTime(ctx, chatID, user)
 	case "weather":
-		if !user.HasCity() {
-			b.askCity(ctx, chatID, user.ID)
-			return
-		}
-		b.sendWeather(ctx, chatID, user, true)
-
+		b.cmdWeather(ctx, chatID, user)
+	case "todos":
+		b.cmdTodos(ctx, chatID, user)
+	case "settings":
+		b.cmdSettings(ctx, chatID, user)
 	case "forget":
 		if err := b.store.ClearMessages(ctx, user.ID); err != nil {
 			slog.Error("clear messages", "err", err)
 			return
 		}
 		b.reply(ctx, chatID, "Ок, забыли наш разговор 🤝 Начнём с чистого листа.")
-
-	case "on":
-		if !user.HasCity() {
-			b.askCity(ctx, chatID, user.ID)
+	case "cancel":
+		if err := b.store.SetState(ctx, user.ID, storage.StateNone); err != nil {
+			slog.Error("set state", "err", err)
 			return
 		}
-		if err := b.store.SetDailyEnabled(ctx, user.ID, true); err != nil {
-			slog.Error("daily on", "err", err)
-			return
-		}
-		b.reply(ctx, chatID, fmt.Sprintf("Включила ✅ Буду писать погоду каждый день в %s.", user.DailyTime))
-
-	case "off":
-		if err := b.store.SetDailyEnabled(ctx, user.ID, false); err != nil {
-			slog.Error("daily off", "err", err)
-			return
-		}
-		b.reply(ctx, chatID, "Выключила утреннюю погоду 🔕 (вернуть: /on)")
-
+		b.reply(ctx, chatID, "Ок, отменила ✋")
 	default:
 		b.reply(ctx, chatID, "Не знаю такую команду 🤷‍♀️ Посмотри /help")
+	}
+}
+
+func (b *Bot) cmdStart(ctx context.Context, chatID int64, user *storage.User) {
+	if user.HasCity() {
+		b.sendWithMenu(ctx, chatID, fmt.Sprintf("С возвращением, %s! 👋 Всё на месте: город %s, погода приходит в %s.", firstName(user), *user.CityName, user.DailyTime))
+		return
+	}
+	b.sendWithMenu(ctx, chatID, fmt.Sprintf("Привет, %s! 👋 Я Надя — твой персональный бот.\nБуду каждое утро присылать погоду, вести список дел и отвечать на вопросы.", firstName(user)))
+	b.askCity(ctx, chatID, user.ID)
+}
+
+func (b *Bot) cmdCity(ctx context.Context, chatID int64, user *storage.User) {
+	b.askCity(ctx, chatID, user.ID)
+}
+
+func (b *Bot) cmdTime(ctx context.Context, chatID int64, user *storage.User) {
+	if !user.HasCity() {
+		b.askCity(ctx, chatID, user.ID)
+		return
+	}
+	if err := b.store.SetState(ctx, user.ID, storage.StateAwaitingTime); err != nil {
+		slog.Error("set state", "err", err)
+		return
+	}
+	b.reply(ctx, chatID, fmt.Sprintf(
+		"Сейчас присылаю погоду в %s ⏰\nВо сколько присылать? Напиши время в формате ЧЧ:ММ, например 08:00.",
+		user.DailyTime))
+}
+
+func (b *Bot) cmdWeather(ctx context.Context, chatID int64, user *storage.User) {
+	if !user.HasCity() {
+		b.askCity(ctx, chatID, user.ID)
+		return
+	}
+	b.sendWeather(ctx, chatID, user, true)
+}
+
+func (b *Bot) cmdTodos(ctx context.Context, chatID int64, user *storage.User) {
+	b.sendTodosList(ctx, chatID, user)
+}
+
+func (b *Bot) cmdSettings(ctx context.Context, chatID int64, user *storage.User) {
+	markup := b.settingsMarkup(user)
+	msg := tgbotapi.NewMessage(chatID, b.settingsText(user))
+	msg.ReplyMarkup = &markup
+	if _, err := b.api.Send(msg); err != nil {
+		slog.Error("send settings", "err", err)
 	}
 }
 
@@ -305,14 +367,94 @@ func (b *Bot) sendWeather(ctx context.Context, chatID int64, u *storage.User, re
 	b.reply(ctx, chatID, weather.FormatDaily(forecast))
 }
 
-func (b *Bot) reply(ctx context.Context, chatID int64, text string) {
-	if runed := []rune(text); len(runed) > maxMessageRunes {
-		text = string(runed[:maxMessageRunes])
+// ---- колбэки от инлайн-кнопок ----
+
+func (b *Bot) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
+	if cb.Message == nil {
+		return
 	}
-	msg := tgbotapi.NewMessage(chatID, text)
+	if !b.cfg.IsAllowed(cb.From.ID) {
+		b.answerCallback(cb.ID, "Нет доступа")
+		return
+	}
+
+	user, err := b.store.EnsureUser(ctx, cb.From.ID, cb.From.UserName, cb.From.FirstName)
+	if err != nil {
+		slog.Error("не удалось создать пользователя", "err", err)
+		return
+	}
+
+	data := cb.Data
+	chatID := cb.Message.Chat.ID
+	messageID := cb.Message.MessageID
+
+	switch {
+	case data == "td_add":
+		if err := b.store.SetState(ctx, user.ID, storage.StateAwaitingTodo); err != nil {
+			slog.Error("set state", "err", err)
+			return
+		}
+		b.answerCallback(cb.ID, "Напиши задачу следующим сообщением ✍️")
+	case strings.HasPrefix(data, "td_toggle:"):
+		id, err := strconv.ParseInt(strings.TrimPrefix(data, "td_toggle:"), 10, 64)
+		if err != nil {
+			b.answerCallback(cb.ID, "Хм, не поняла")
+			return
+		}
+		b.toggleTodo(ctx, cb.ID, chatID, messageID, user, id)
+	case data == "td_clear":
+		b.clearDoneTodos(ctx, cb.ID, chatID, messageID, user)
+	case strings.HasPrefix(data, "st_"):
+		b.handleSettingsCallback(ctx, cb, user, data)
+	default:
+		b.answerCallback(cb.ID, "")
+	}
+}
+
+// ---- helpers ----
+
+func (b *Bot) answerCallback(cbID, text string) {
+	if _, err := b.api.Request(tgbotapi.NewCallback(cbID, text)); err != nil {
+		slog.Warn("answer callback", "err", err)
+	}
+}
+
+func (b *Bot) editWithMarkup(ctx context.Context, chatID int64, messageID int, text string, markup tgbotapi.InlineKeyboardMarkup) {
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, truncateRunes(text, maxMessageRunes))
+	edit.ReplyMarkup = &markup
+	if _, err := b.api.Request(edit); err != nil {
+		slog.Warn("edit message", "err", err)
+	}
+}
+
+func (b *Bot) sendWithMenu(ctx context.Context, chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, truncateRunes(text, maxMessageRunes))
+	msg.ReplyMarkup = mainMenuKeyboard()
 	if _, err := b.api.Send(msg); err != nil {
 		slog.Error("send message", "chat_id", chatID, "err", err)
 	}
+}
+
+func (b *Bot) reply(ctx context.Context, chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, truncateRunes(text, maxMessageRunes))
+	if _, err := b.api.Send(msg); err != nil {
+		slog.Error("send message", "chat_id", chatID, "err", err)
+	}
+}
+
+// mainMenuKeyboard — постоянная клавиатура внизу экрана.
+func mainMenuKeyboard() *tgbotapi.ReplyKeyboardMarkup {
+	kb := tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("🌤 Погода"),
+			tgbotapi.NewKeyboardButton("📝 Дела"),
+		),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("⚙️ Настройки"),
+		),
+	)
+	kb.ResizeKeyboard = true
+	return &kb
 }
 
 func firstName(u *storage.User) string {

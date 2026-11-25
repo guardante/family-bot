@@ -15,6 +15,8 @@ import (
 	"nadia_bot/internal/bot"
 	"nadia_bot/internal/config"
 	"nadia_bot/internal/glm"
+	"nadia_bot/internal/integrations"
+	"nadia_bot/internal/integrations/todoist"
 	"nadia_bot/internal/storage"
 )
 
@@ -52,7 +54,10 @@ func main() {
 	slog.Info("бот запущен", "username", api.Self.UserName, "model", cfg.GLMModel)
 
 	store := storage.New(db)
-	b := bot.New(cfg, api, store, glm.New(cfg.GLMAPIKey, cfg.GLMBaseURL, cfg.GLMModel))
+	registry := integrations.NewRegistry(todoist.New())
+	b := bot.New(cfg, api, store,
+		glm.New(cfg.GLMAPIKey, cfg.GLMBaseURL, cfg.GLMModel, cfg.GLMVisionModel),
+		registry)
 
 	if err := b.SetCommands(ctx); err != nil {
 		slog.Warn("не удалось задать команды", "err", err)

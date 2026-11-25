@@ -130,4 +130,74 @@ func TestSQLiteFullCycle(t *testing.T) {
 	if msgs, _ := s.RecentMessages(ctx, 42, 100); len(msgs) != 0 {
 		t.Fatalf("messages not cleared: %d", len(msgs))
 	}
+
+	// --- список дел ---
+	t1, err := s.AddTodo(ctx, 42, "Купить хлеб")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t2, err := s.AddTodo(ctx, 42, "Позвонить маме")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTodoRemote(ctx, 42, t2, "todoist", "98765"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTodoDone(ctx, 42, t1, true); err != nil {
+		t.Fatal(err)
+	}
+
+	items, err := s.Todos(ctx, 42, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 || items[0].Done || !items[1].Done {
+		t.Fatalf("todos order/state: %+v", items)
+	}
+	// Выполненные уходят в конец списка, поэтому remote у items[0].
+	if items[0].RemoteID == nil || *items[0].RemoteID != "98765" || *items[0].Provider != "todoist" {
+		t.Fatalf("remote id not saved: %+v", items[0])
+	}
+
+	got, err := s.GetTodo(ctx, 42, t2)
+	if err != nil || got == nil || got.Text != "Позвонить маме" {
+		t.Fatalf("get todo: %+v %v", got, err)
+	}
+
+	if err := s.SetTodoDone(ctx, 42, t1, false); err != nil {
+		t.Fatal(err)
+	}
+	if u, _ := s.GetUser(ctx, 42); u == nil {
+		t.Fatal("user lost")
+	}
+	if done, err := s.ClearDone(ctx, 42); err != nil || len(done) != 0 {
+		t.Fatalf("clear done: %v %v", done, err)
+	}
+	if err := s.SetTodoDone(ctx, 42, t2, true); err != nil {
+		t.Fatal(err)
+	}
+	if done, err := s.ClearDone(ctx, 42); err != nil || len(done) != 1 || done[0].ID != t2 {
+		t.Fatalf("clear done after re-done: %v %v", done, err)
+	}
+	// t1 осталась активной, t2 удалена вместе с "сделанными".
+	if items, _ := s.Todos(ctx, 42, 50); len(items) != 1 || items[0].ID != t1 || items[0].Done {
+		t.Fatalf("todos after clear: %+v", items)
+	}
+	if _, err := s.DeleteTodo(ctx, 42, t1); err != nil {
+		t.Fatal(err)
+	}
+
+	// --- токен интеграции ---
+	if err := s.SetTodoistToken(ctx, 42, "secret-token"); err != nil {
+		t.Fatal(err)
+	}
+	if u, _ = s.GetUser(ctx, 42); u.TodoistToken == nil || *u.TodoistToken != "secret-token" {
+		t.Fatalf("todoist token: %+v", u)
+	}
+	if err := s.SetTodoistToken(ctx, 42, ""); err != nil {
+		t.Fatal(err)
+	}
+	if u, _ = s.GetUser(ctx, 42); u.TodoistToken != nil {
+		t.Fatalf("todoist token not cleared: %+v", u)
+	}
 }
