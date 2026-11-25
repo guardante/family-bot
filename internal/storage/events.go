@@ -15,6 +15,7 @@ type Event struct {
 	RemindMinutes *int
 	Notified      bool
 	CreatedAt     string
+	CaldavUID     *string // UID события в календаре Apple (если синхронизировано)
 }
 
 // NormalizeEventAt приводит время к формату хранения: UTC, секунды.
@@ -27,7 +28,7 @@ func ParseEventAt(s string) (time.Time, error) {
 	return time.Parse("2006-01-02T15:04:05Z", s)
 }
 
-const eventCols = `id, user_id, title, event_at, remind_minutes, notified, created_at`
+const eventCols = `id, user_id, title, event_at, remind_minutes, notified, created_at, caldav_uid`
 
 func (s *Storage) AddEvent(ctx context.Context, userID int64, title, eventAtUTC string, remindMinutes *int) (int64, error) {
 	res, err := s.db.ExecContext(ctx, `
@@ -72,9 +73,33 @@ func (s *Storage) MarkEventNotified(ctx context.Context, id int64) error {
 	return err
 }
 
-func (s *Storage) DeleteEvent(ctx context.Context, userID, eventID int64) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM events WHERE user_id = ? AND id = ?`, userID, eventID)
+func (s *Storage) DeleteEvent(ctx context.Context, userID, eventID int64) (*Event, error) {
+	ev, err := s.getEvent(ctx, userID, eventID)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM events WHERE user_id = ? AND id = ?`, userID, eventID); err != nil {
+		return nil, err
+	}
+	return ev, nil
+}
+
+// SetEventCaldavUID привязывает событие к событию в календаре Apple.
+func (s *Storage) SetEventCaldavUID(ctx context.Context, userID, eventID int64, uid string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE events SET caldav_uid = ? WHERE user_id = ? AND id = ?`, uid, userID, eventID)
 	return err
+}
+
+func (s *Storage) getEvent(ctx context.Context, userID, eventID int64) (*Event, error) {
+	e := &Event{}
+	err := s.db.QueryRowContext(ctx, `
+		SELECT `+eventCols+` FROM events WHERE user_id = ? AND id = ?`, userID, eventID,
+	).Scan(&e.ID, &e.UserID, &e.Title, &e.EventAt, &e.RemindMinutes, &e.Notified, &e.CreatedAt, &e.CaldavUID)
+	if err != nil {
+		return nil, err
+	}
+	return e, nil
 }
 
 func scanEvents(rows interface {
@@ -85,7 +110,7 @@ func scanEvents(rows interface {
 	var events []Event
 	for rows.Next() {
 		var e Event
-		if err := rows.Scan(&e.ID, &e.UserID, &e.Title, &e.EventAt, &e.RemindMinutes, &e.Notified, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.UserID, &e.Title, &e.EventAt, &e.RemindMinutes, &e.Notified, &e.CreatedAt, &e.CaldavUID); err != nil {
 			return nil, err
 		}
 		events = append(events, e)

@@ -19,6 +19,15 @@ type Config struct {
 	WebAppURL  string // напр. https://xxx.trycloudflare.com — пусто = кнопку не показывать
 	WebAppPort string
 
+	// Распознавание речи (OpenAI-совместимый /audio/transcriptions).
+	// Подходит Groq (бесплатный тариф) или OpenAI.
+	STTBaseURL string
+	STTAPIKey  string
+	STTModel   string
+
+	// CalDAV-сервер (по умолчанию iCloud — календарь Apple на iPhone/Mac).
+	CaldavURL string
+
 	// GLM (OpenAI-совместимый API)
 	GLMAPIKey      string
 	GLMBaseURL     string
@@ -43,6 +52,10 @@ func Load() (*Config, error) {
 		HistoryLimit:   16,
 		WebAppURL:      strings.TrimRight(strings.TrimSpace(os.Getenv("WEBAPP_URL")), "/"),
 		WebAppPort:     getenv("WEBAPP_PORT", "8080"),
+		STTBaseURL:     getenv("STT_BASE_URL", "https://api.groq.com/openai/v1"),
+		STTAPIKey:      strings.TrimSpace(os.Getenv("STT_API_KEY")),
+		STTModel:       getenv("STT_MODEL", "whisper-large-v3-turbo"),
+		CaldavURL:      getenv("CALDAV_URL", "https://caldav.icloud.com"),
 	}
 
 	if cfg.BotToken == "" {

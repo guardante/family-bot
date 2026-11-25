@@ -16,7 +16,9 @@ import (
 	"nadia_bot/internal/config"
 	"nadia_bot/internal/glm"
 	"nadia_bot/internal/integrations"
+	"nadia_bot/internal/integrations/caldav"
 	"nadia_bot/internal/storage"
+	"nadia_bot/internal/stt"
 	"nadia_bot/internal/weather"
 )
 
@@ -32,12 +34,14 @@ type Bot struct {
 	llm     *glm.Client
 	weather *weather.Client
 	apps    *integrations.Registry
-	http    *http.Client // скачивание фото из Telegram
+	http    *http.Client // скачивание фото и голосовых из Telegram
+	stt     *stt.Client  // распознавание речи; nil, если ключ не задан
+	caldav  *caldav.Client
 }
 
 func New(cfg *config.Config, api *tgbotapi.BotAPI, store *storage.Storage,
 	llm *glm.Client, apps *integrations.Registry) *Bot {
-	return &Bot{
+	b := &Bot{
 		cfg:     cfg,
 		api:     api,
 		store:   store,
@@ -45,7 +49,12 @@ func New(cfg *config.Config, api *tgbotapi.BotAPI, store *storage.Storage,
 		weather: weather.New(),
 		apps:    apps,
 		http:    &http.Client{Timeout: 60 * time.Second},
+		caldav:  caldav.New(),
 	}
+	if cfg.STTAPIKey != "" {
+		b.stt = stt.New(cfg.STTAPIKey, cfg.STTBaseURL, cfg.STTModel)
+	}
+	return b
 }
 
 func (b *Bot) SetCommands(ctx context.Context) error {
@@ -90,6 +99,12 @@ func (b *Bot) HandleUpdate(ctx context.Context, upd tgbotapi.Update) {
 		return
 	}
 
+	// Голосовое — речь в события календаря.
+	if msg.Voice != nil {
+		b.handleVoice(ctx, msg, user)
+		return
+	}
+
 	text := strings.TrimSpace(msg.Text)
 	if text == "" {
 		b.reply(ctx, msg.Chat.ID, "Я понимаю текст и фото 🙂")
@@ -115,6 +130,8 @@ func (b *Bot) HandleUpdate(ctx context.Context, upd tgbotapi.Update) {
 		b.addTodoFromText(ctx, msg.Chat.ID, user, text)
 	case storage.StateAwaitingTodoist:
 		b.connectTodoist(ctx, msg.Chat.ID, user, text)
+	case storage.StateAwaitingCaldav:
+		b.connectCaldav(ctx, msg.Chat.ID, user, text)
 	default:
 		b.handleChat(ctx, msg.Chat.ID, user, text)
 	}
@@ -147,16 +164,18 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message, user *st
 		b.cmdStart(ctx, chatID, user)
 	case "help":
 		b.reply(ctx, chatID, "Вот что я умею:\n"+
-			"• /weather — погода на сегодня\n"+
-			"• /todos — список дел\n"+
+			"• 🎙 Голосовое сообщение — наговори события, я распознаю и добавлю в календарь\n"+
 			"• /event 05.01 18:30 Название — добавить событие (🔔 напомню за 30 мин)\n"+
 			"• /events — ближайшие события\n"+
 			"• /event_del 2 — удалить событие по номеру\n"+
+			"• /weather — погода на сегодня\n"+
+			"• /todos — список дел\n"+
 			"• /city — сменить город\n"+
 			"• /time — во сколько присылать утреннюю погоду\n"+
+			"• /settings — настройки и интеграции\n"+
 			"• /forget — забыть наш разговор\n"+
 			"• /cancel — выйти из текущего вопроса\n\n"+
-			"Пришли фото с текстом — распознаю. Просто пиши мне — отвечу на вопросы 🙂")
+			"Каждое утро — погода и дайджест событий. Пришли фото с текстом — распознаю. Просто пиши — отвечу на вопросы 🙂")
 
 	case "city":
 		b.cmdCity(ctx, chatID, user)
@@ -272,6 +291,34 @@ func (b *Bot) upcomingEvents(ctx context.Context, user *storage.User, limit int)
 		storage.NormalizeEventAt(time.Now().Add(-2*time.Hour)), limit)
 }
 
+// caldavPush добавляет событие в календарь Apple, если интеграция подключена.
+func (b *Bot) caldavPush(ctx context.Context, u *storage.User, eventID int64, title string, at time.Time) error {
+	login, pass, ok := caldavCreds(u)
+	if !ok {
+		return nil // интеграция не подключена — это не ошибка
+	}
+	uid, err := b.caldav.PutEvent(ctx, login, pass, b.cfg.CaldavURL, "Надя", title, at)
+	if err != nil {
+		return err
+	}
+	return b.store.SetEventCaldavUID(ctx, u.ID, eventID, uid)
+}
+
+func caldavLogin(u *storage.User) string {
+	if u.CaldavLogin == nil {
+		return ""
+	}
+	return *u.CaldavLogin
+}
+
+func caldavCreds(u *storage.User) (string, string, bool) {
+	login := caldavLogin(u)
+	if u.CaldavPassword == nil || login == "" || *u.CaldavPassword == "" {
+		return "", "", false
+	}
+	return login, *u.CaldavPassword, true
+}
+
 // cmdAddEvent — "/event 05.01 18:30 Название".
 func (b *Bot) cmdAddEvent(ctx context.Context, chatID int64, user *storage.User, args string) {
 	loc, err := time.LoadLocation(user.Timezone)
@@ -285,13 +332,20 @@ func (b *Bot) cmdAddEvent(ctx context.Context, chatID int64, user *storage.User,
 	}
 
 	remind := 30 // напомнить за 30 минут по умолчанию
-	if _, err := b.store.AddEvent(ctx, user.ID, title, storage.NormalizeEventAt(at), &remind); err != nil {
+	id, err := b.store.AddEvent(ctx, user.ID, title, storage.NormalizeEventAt(at), &remind)
+	if err != nil {
 		slog.Error("add event", "err", err)
 		b.reply(ctx, chatID, "Не получилось сохранить 😔")
 		return
 	}
-	b.reply(ctx, chatID, fmt.Sprintf("📅 Событие сохранено: %s\nКогда: %s\n🔔 Напомню за 30 минут",
-		title, at.Format("02.01.2006 в 15:04")))
+
+	syncNote := ""
+	if err := b.caldavPush(ctx, user, id, title, at); err != nil {
+		slog.Warn("caldav push", "err", err)
+		syncNote = "\n⚠️ В календарь Apple не добавилось: " + err.Error()
+	}
+	b.reply(ctx, chatID, fmt.Sprintf("📅 Событие сохранено: %s\nКогда: %s\n🔔 Напомню за 30 минут%s",
+		title, at.Format("02.01.2006 в 15:04"), syncNote))
 }
 
 // cmdDeleteEvent — "/event_del 2" по нумерации из /events.
@@ -312,12 +366,22 @@ func (b *Bot) cmdDeleteEvent(ctx context.Context, chatID int64, user *storage.Us
 		return
 	}
 	ev := events[n-1]
-	if err := b.store.DeleteEvent(ctx, user.ID, ev.ID); err != nil {
+	deleted, err := b.store.DeleteEvent(ctx, user.ID, ev.ID)
+	if err != nil {
 		slog.Error("delete event", "err", err)
 		b.reply(ctx, chatID, "Не получилось удалить 😔")
 		return
 	}
-	b.reply(ctx, chatID, "Удалила: "+ev.Title)
+
+	// Удаляем и из календаря Apple (по возможности).
+	if deleted != nil && deleted.CaldavUID != nil {
+		if login, pass, ok := caldavCreds(user); ok {
+			if err := b.caldav.DeleteEvent(ctx, login, pass, b.cfg.CaldavURL, "Надя", *deleted.CaldavUID); err != nil {
+				slog.Warn("caldav delete", "err", err)
+			}
+		}
+	}
+	b.reply(ctx, chatID, "Удалила: "+deleted.Title)
 }
 
 // humanDelta — человекочитаемый интервал ("15 мин", "1 ч 30 мин", "2 дн").

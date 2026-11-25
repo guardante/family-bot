@@ -336,7 +336,7 @@ func (h *Handler) handleEventDelete(w http.ResponseWriter, r *http.Request, tgUs
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if err := h.store.DeleteEvent(r.Context(), tgUser.ID, req.ID); err != nil {
+	if _, err := h.store.DeleteEvent(r.Context(), tgUser.ID, req.ID); err != nil {
 		http.Error(w, "internal", http.StatusInternalServerError)
 		return
 	}

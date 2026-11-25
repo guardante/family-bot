@@ -13,21 +13,24 @@ const (
 	StateAwaitingTime    = "awaiting_time"
 	StateAwaitingTodo    = "awaiting_todo"
 	StateAwaitingTodoist = "awaiting_todoist_token"
+	StateAwaitingCaldav  = "awaiting_caldav"
 )
 
 type User struct {
-	ID            int64
-	Username      string
-	FirstName     string
-	CityName      *string // nil, пока город не задан
-	CityLat       *float64
-	CityLon       *float64
-	Timezone      string
-	DailyTime     string // "ЧЧ:ММ" по локальному времени пользователя
-	DailyEnabled  bool
-	LastDailyDate *string // "ГГГГ-ММ-ДД", когда последний раз отправляли утренний прогноз
-	State         string
-	TodoistToken  *string // персональный API-токен Todoist (опциональная интеграция)
+	ID             int64
+	Username       string
+	FirstName      string
+	CityName       *string // nil, пока город не задан
+	CityLat        *float64
+	CityLon        *float64
+	Timezone       string
+	DailyTime      string // "ЧЧ:ММ" по локальному времени пользователя
+	DailyEnabled   bool
+	LastDailyDate  *string // "ГГГГ-ММ-ДД", когда последний раз отправляли утренний прогноз
+	State          string
+	TodoistToken   *string // персональный API-токен Todoist (опциональная интеграция)
+	CaldavLogin    *string // Apple ID / логин CalDAV (опциональная интеграция)
+	CaldavPassword *string // пароль приложения
 }
 
 func (u *User) HasCity() bool { return u.CityName != nil }
@@ -39,7 +42,8 @@ func New(db *sql.DB) *Storage {
 }
 
 const userCols = `id, username, first_name, city_name, city_lat, city_lon,
-	timezone, daily_time, daily_enabled, last_daily_date, state, todoist_token`
+	timezone, daily_time, daily_enabled, last_daily_date, state, todoist_token,
+	caldav_login, caldav_password`
 
 // EnsureUser создаёт пользователя, если его нет, и обновляет имя/юзернейм.
 func (s *Storage) EnsureUser(ctx context.Context, id int64, username, firstName string) (*User, error) {
@@ -65,6 +69,7 @@ func (s *Storage) GetUser(ctx context.Context, id int64) (*User, error) {
 	).Scan(
 		&u.ID, &u.Username, &u.FirstName, &u.CityName, &u.CityLat, &u.CityLon,
 		&u.Timezone, &u.DailyTime, &u.DailyEnabled, &u.LastDailyDate, &u.State, &u.TodoistToken,
+		&u.CaldavLogin, &u.CaldavPassword,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -125,6 +130,16 @@ func (s *Storage) SetTodoistToken(ctx context.Context, id int64, token string) e
 	return err
 }
 
+// SetCaldavAuth сохраняет (пустая строка = отключить) учётку календаря.
+func (s *Storage) SetCaldavAuth(ctx context.Context, id int64, login, password string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE users
+		SET caldav_login = NULLIF(?, ''), caldav_password = NULLIF(?, ''),
+			updated_at = datetime('now')
+		WHERE id = ?`, login, password, id)
+	return err
+}
+
 // DailyUsers — те, кому нужно отправлять утренний прогноз.
 func (s *Storage) DailyUsers(ctx context.Context) ([]User, error) {
 	rows, err := s.db.QueryContext(ctx, `
@@ -141,6 +156,7 @@ func (s *Storage) DailyUsers(ctx context.Context) ([]User, error) {
 		if err := rows.Scan(
 			&u.ID, &u.Username, &u.FirstName, &u.CityName, &u.CityLat, &u.CityLon,
 			&u.Timezone, &u.DailyTime, &u.DailyEnabled, &u.LastDailyDate, &u.State, &u.TodoistToken,
+			&u.CaldavLogin, &u.CaldavPassword,
 		); err != nil {
 			return nil, err
 		}

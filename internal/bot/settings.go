@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
@@ -25,7 +26,11 @@ func (b *Bot) settingsText(u *storage.User) string {
 	if todoistToken(u) != "" {
 		td = "подключён ✅"
 	}
-	return fmt.Sprintf("⚙️ Настройки\n\n🏙 Город: %s\n⏰ Утренняя погода: %s (%s)\n🔗 Todoist: %s", city, u.DailyTime, daily, td)
+	cal := "не подключён"
+	if _, _, ok := caldavCreds(u); ok {
+		cal = "подключён ✅"
+	}
+	return fmt.Sprintf("⚙️ Настройки\n\n🏙 Город: %s\n⏰ Утренняя погода: %s (%s)\n🔗 Todoist: %s\n📅 Календарь Apple: %s", city, u.DailyTime, daily, td, cal)
 }
 
 func (b *Bot) settingsMarkup(u *storage.User) tgbotapi.InlineKeyboardMarkup {
@@ -37,6 +42,10 @@ func (b *Bot) settingsMarkup(u *storage.User) tgbotapi.InlineKeyboardMarkup {
 	if todoistToken(u) != "" {
 		tdLabel = "🧩 Отключить Todoist"
 	}
+	calLabel := "📅 Подключить Apple Календарь"
+	if _, _, ok := caldavCreds(u); ok {
+		calLabel = "📅 Отключить Apple Календарь"
+	}
 
 	rows := [][]tgbotapi.InlineKeyboardButton{
 		tgbotapi.NewInlineKeyboardRow(
@@ -45,6 +54,7 @@ func (b *Bot) settingsMarkup(u *storage.User) tgbotapi.InlineKeyboardMarkup {
 		),
 		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData(dailyLabel, "st_daily")),
 		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData(tdLabel, "st_todoist")),
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData(calLabel, "st_caldav")),
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("🧠 Забыть разговор", "st_forget"),
 			tgbotapi.NewInlineKeyboardButtonData("✖️ Закрыть", "st_close"),
@@ -103,6 +113,28 @@ func (b *Bot) handleSettingsCallback(ctx context.Context, cb *tgbotapi.CallbackQ
 		b.reply(ctx, chatID, "Пришли персональный API-токен Todoist одним сообщением.\n\n"+
 			"Где взять: Todoist → Настройки → Интеграции → API-токен.\nОтменить: /cancel")
 
+	case "st_caldav":
+		if _, _, ok := caldavCreds(user); ok {
+			if err := b.store.SetCaldavAuth(ctx, user.ID, "", ""); err != nil {
+				slog.Error("caldav disconnect", "err", err)
+				b.answerCallback(cb.ID, "Ошибка")
+				return
+			}
+			b.answerCallback(cb.ID, "Календарь Apple отключён")
+			b.editWithMarkup(ctx, chatID, messageID, b.settingsText(user), b.settingsMarkup(user))
+			return
+		}
+		b.answerCallback(cb.ID, "")
+		_, _ = b.api.Request(tgbotapi.NewDeleteMessage(chatID, messageID))
+		if err := b.store.SetState(ctx, user.ID, storage.StateAwaitingCaldav); err != nil {
+			slog.Error("set state", "err", err)
+			return
+		}
+		b.reply(ctx, chatID, "Подключим календарь Apple 📅\n\n"+
+			"Пришли одним сообщением в формате:\napple_id:пароль_приложения\n\n"+
+			"Где взять: account.apple.com → Вход и безопасность → Пароль приложения (создай для бота).\n"+
+			"Обычный пароль от Apple ID не подходит — только пароль приложения!\nОтменить: /cancel")
+
 	case "st_forget":
 		if err := b.store.ClearMessages(ctx, user.ID); err != nil {
 			slog.Error("clear messages", "err", err)
@@ -119,6 +151,29 @@ func (b *Bot) handleSettingsCallback(ctx context.Context, cb *tgbotapi.CallbackQ
 	default:
 		b.answerCallback(cb.ID, "")
 	}
+}
+
+// connectCaldav — пользователь прислал "apple_id:пароль_приложения".
+func (b *Bot) connectCaldav(ctx context.Context, chatID int64, user *storage.User, text string) {
+	login, pass, ok := strings.Cut(strings.TrimSpace(text), ":")
+	if !ok || login == "" || pass == "" {
+		b.reply(ctx, chatID, "Нужно два значения через двоеточие:\napple_id:пароль_приложения\n\nПопробуй ещё раз или /cancel.")
+		return
+	}
+
+	if err := b.caldav.Validate(ctx, login, pass, b.cfg.CaldavURL); err != nil {
+		b.reply(ctx, chatID, "Не подключилось: "+err.Error()+"\nПроверь логин и пароль приложения, или /cancel.")
+		return
+	}
+
+	if err := b.store.SetCaldavAuth(ctx, user.ID, login, pass); err != nil {
+		slog.Error("save caldav", "err", err)
+		return
+	}
+	if err := b.store.SetState(ctx, user.ID, storage.StateNone); err != nil {
+		slog.Error("set state", "err", err)
+	}
+	b.reply(ctx, chatID, "Календарь Apple подключён ✅\nНовые события будут появляться на iPhone и Mac. А ещё можно просто наговорить их голосом 🎙")
 }
 
 // connectTodoist — пользователь прислал токен в ответ на запрос.

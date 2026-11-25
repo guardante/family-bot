@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"nadia_bot/internal/storage"
@@ -63,10 +64,52 @@ func (b *Bot) sendDailyWeather(ctx context.Context) {
 		}
 
 		b.sendWeather(ctx, u.ID, u, false)
+		// Ежедневный дайджест событий — сразу после погоды.
+		if digest := b.eventsDigest(ctx, u); digest != "" {
+			b.reply(ctx, u.ID, digest)
+		}
 		if err := b.store.MarkDailySent(ctx, u.ID, today); err != nil {
 			slog.Error("scheduler: пометить отправку", "user", u.ID, "err", err)
 		}
 	}
+}
+
+// eventsDigest — список событий на неделю для утреннего сообщения.
+func (b *Bot) eventsDigest(ctx context.Context, u *storage.User) string {
+	events, err := b.upcomingEvents(ctx, u, 10)
+	if err != nil || len(events) == 0 {
+		return ""
+	}
+	loc, err := time.LoadLocation(u.Timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+	now := time.Now().In(loc)
+
+	var sb strings.Builder
+	sb.WriteString("📅 События на неделю:")
+	for _, ev := range events {
+		at, err := storage.ParseEventAt(ev.EventAt)
+		if err != nil {
+			continue
+		}
+		local := at.In(loc)
+		day := local.Format("02.01")
+		switch {
+		case sameDay(local, now):
+			day = "сегодня"
+		case sameDay(local, now.AddDate(0, 0, 1)):
+			day = "завтра"
+		}
+		sb.WriteString(fmt.Sprintf("\n• %s — %s в %s", ev.Title, day, local.Format("15:04")))
+	}
+	return sb.String()
+}
+
+func sameDay(a, b time.Time) bool {
+	ay, am, ad := a.Date()
+	by, bm, bd := b.Date()
+	return ay == by && am == bm && ad == bd
 }
 
 // checkEventReminders — напоминания о событиях календаря.
